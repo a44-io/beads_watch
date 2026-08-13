@@ -1,0 +1,31 @@
+[Unit]
+Description=beads_watch — serve br over the tailnet
+Documentation=https://github.com/a44-io/beads_watch
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/beads_watch
+Restart=on-failure
+RestartSec=2s
+
+# The daemon scrubs these from br's environment anyway, but a service file that
+# cannot introduce them is one less way to end up serving the wrong workspace.
+UnsetEnvironment=BEADS_DIR BD_DB BD_DATABASE BD_ACTOR BR_OUTPUT_FORMAT TOON_DEFAULT_FORMAT
+Environment=RUST_LOG=error
+
+# br needs to read and write .beads/ across the home directory, so the
+# filesystem stays writable; the rest is tightened.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-write
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target
