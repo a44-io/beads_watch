@@ -21,10 +21,13 @@ predicates had quietly diverged. This daemon cannot develop that bug.
 
 ```
 any tailnet machine / phone
-   │  https, ACL-gated, caller identity forwarded
+   │  https://beads-arch.dev.a44.io
    ▼
-arch.example.ts.net
-   │  tailscale serve  →  unix:/run/user/1000/beads_watch.sock
+caddy on pi          wildcard *.dev.a44.io cert (DNS-01), tailnet-bound
+   │  reverse_proxy 100.110.83.42:8438
+   ▼
+systemd-socket-proxyd   (beads_watch-proxy.socket, tailscale IP only)
+   │  →  unix:/run/user/1000/beads_watch.sock
    ▼
 beads_watch
    │  exec: br <args...>   (cwd = repo, hostile env scrubbed)
@@ -32,13 +35,17 @@ beads_watch
 .beads/
 ```
 
-`tailscale serve` does the transport: HTTPS with a real cert, access control via
-tailnet ACLs, and caller identity. This daemon writes zero networking, zero
-auth, zero TLS.
+Caddy on pi does the transport: HTTPS with a real wildcard cert, listening
+only on the tailnet address. On each serving box a `systemd-socket-proxyd`
+bridge accepts TCP on that box's tailscale IP and forwards to the 0600 unix
+socket, so the daemon itself still writes zero networking, zero auth, zero
+TLS. (`tailscale serve` used to play caddy's role; the caddy names are
+stable, cover every box under one cert, and don't need root on the box.)
 
-When repos eventually live on other machines, there is still no hub to build.
-Each machine runs this same binary behind its own `tailscale serve`, addressed
-as `dev.example.ts.net`, `vps.…`, and so on. **MagicDNS is the directory.**
+When repos live on other machines, there is still no hub to build. Each
+machine runs this same binary behind its own bridge, and caddy names it
+`beads-<node>.dev.a44.io` — `beads-arch`, `beads-dev`, and so on. **The
+caddy sites directory is the directory.**
 
 ## API
 
@@ -137,18 +144,28 @@ audit trail records who did what from where.
 
 Resolution order:
 
-1. **`Tailscale-User-Login`** — the proxy *strips* a client-supplied copy of
-   this header, so its presence means tailscaled put it there.
-2. **WhoIs on `X-Forwarded-For`** — the proxy *replaces* rather than appends
-   this header, so the address is its own view of the peer and a caller cannot
-   prepend a forged entry.
+1. **`Tailscale-User-Login`** — the proxy must *strip* a client-supplied
+   copy, so its presence means the proxy itself put it there. `tailscale
+   serve` does this natively; caddy does not, so the beads site files carry
+   an explicit `header_up -Tailscale-User-Login` — without it any tailnet
+   caller can forge a verified actor (demonstrated live, then fixed).
+2. **WhoIs on `X-Forwarded-For`** — the daemon takes the *last* entry, which
+   is the proxy's own view of the peer. Caddy *appends* its observed client
+   address, so a caller's forged prefix loses; `tailscale serve` *replaces*
+   the header outright. Either way the address that wins is
+   transport-observed, then resolved with `tailscale whois`.
 3. **`actor` in the request body** — self-asserted, recorded as unverified.
 4. **Nothing** — `BD_ACTOR` is left unset and `br` uses its own default.
 
-Both proxy behaviours above were verified by experiment against tailscale
-1.98.9, not assumed. A request from `dev` carrying
-`Tailscale-User-Login: attacker@evil.com` and `X-Forwarded-For: 9.9.9.9` still
-resolves to `dev`.
+All three proxy behaviours were verified by experiment (tailscale 1.98.9;
+caddy via the live `beads-arch.dev.a44.io` chain), not assumed. A request
+from `dev` through caddy resolves to `actor: dev`, `source:
+tailscale-whois`, `verified: true` — and one carrying a forged
+`Tailscale-User-Login: attacker@evil.com` or `X-Forwarded-For: 9.9.9.9`
+still does. A caller that reaches the bridge port directly, skipping caddy,
+can still assert either header unchallenged — that hole and its fix
+(trusted-proxy peers, which needs the daemon to see the real TCP peer) are
+bead `bw-mub`.
 
 **On this tailnet, user identity is not available.** 13 of 15 nodes are
 `tagged-devices`, which have no owning user for tailscale to report. So the
@@ -158,8 +175,10 @@ daemon reports `"source": "none"` instead of guessing when it knows nothing.
 
 ## Security
 
-The daemon binds a unix socket at mode `0600`. `tailscale serve` proxies to it
-as root, which is unaffected by mode bits, while other local users are shut out.
+The daemon binds a unix socket at mode `0600`. The bridge
+(`systemd-socket-proxyd`, same user) connects to it while other local users
+are shut out; the bridge's own TCP port binds only the tailscale IP, so the
+LAN never sees it.
 
 Two `br` flags are refused anywhere in `args`, because each breaks a promise
 the URL makes:
@@ -181,9 +200,10 @@ started from a shell that exports it would serve every repo from one workspace
 while still reporting the requested repo's name — a silent, invisible, totally
 wrong answer. There is a regression test for exactly this.
 
-> `--listen` is available for hosts where `tailscale serve` cannot proxy a unix
-> socket (that requires root). It binds localhost TCP, which any local user can
-> reach — prefer the socket.
+> `--listen` makes the daemon bind TCP *instead of* the socket. Prefer the
+> socket plus the proxyd bridge: TCP reachable by any local user, and a
+> daemon that cannot serve both at once, are each worse than the pair of
+> units. (Making `--listen` additive is part of `bw-mub`.)
 
 ## Install
 
@@ -207,18 +227,30 @@ Optional keys: `allow` (replaces the default allowlist), `br_path`,
 `timeout_seconds` (30), `lock_timeout_ms` (5000), `max_output_bytes`,
 `inject_json`.
 
-Then expose it — serving a unix socket needs root:
+Run it under systemd — the units in `systemd/` are made to be symlinked:
 
 ```bash
-sudo tailscale serve --bg --https=443 unix:/run/user/1000/beads_watch.sock
-```
-
-Run it under systemd:
-
-```bash
-systemctl --user enable --now beads_watch
+ln -s ~/dev/beads_watch/systemd/beads_watch.service \
+      ~/dev/beads_watch/systemd/beads_watch-proxy.socket \
+      ~/dev/beads_watch/systemd/beads_watch-proxy.service \
+      ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now beads_watch beads_watch-proxy.socket
 loginctl enable-linger "$USER"   # so it survives logout
 ```
+
+Edit `ListenStream` in `beads_watch-proxy.socket` to this box's own
+`tailscale ip -4` first. Then name it from pi — one line, wildcard cert
+already covers it:
+
+```bash
+ssh pi caddy/expose beads-<node> <tailscale-ip>:8438
+```
+
+and copy the `header_up -Tailscale-User-Login` /
+`header_up -Tailscale-User-Name` strips from an existing `beads-*.caddy`
+into the generated site file (see Identity — without them the verified
+actor is forgeable).
 
 ## Notes
 

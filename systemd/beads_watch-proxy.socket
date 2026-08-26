@@ -1,0 +1,15 @@
+[Unit]
+Description=beads_watch TCP bridge — tailnet :8438 → unix socket
+Documentation=https://github.com/a44-io/beads_watch
+
+[Socket]
+# Bind only the tailscale IP: tailnet peers (i.e. caddy on pi) can reach it,
+# the LAN cannot. FreeBind lets the socket exist before tailscaled brings the
+# address up at login. This is arch's address — when installing on another
+# box, set that box's own `tailscale ip -4` here, then front it from pi:
+#   caddy/expose beads-<node> <that-ip>:8438
+ListenStream=100.110.83.42:8438
+FreeBind=true
+
+[Install]
+WantedBy=sockets.target
