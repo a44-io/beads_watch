@@ -401,9 +401,13 @@ func (w *Watcher) loadState() error {
 }
 
 func (w *Watcher) saveState() error {
+	// The mutex covers the write+rename too: every repo goroutine shares one
+	// tmp path, and two concurrent saves would otherwise steal each other's
+	// tmp file out from under the rename (seen live as ENOENT at startup,
+	// when every repo persists its initial cursor at once).
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	raw, err := json.MarshalIndent(stateDoc{Repos: w.cursors}, "", "  ")
-	w.mu.Unlock()
 	if err != nil {
 		return err
 	}
