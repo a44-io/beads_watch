@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"beads_watch/internal/events"
 	"beads_watch/internal/server"
 )
 
@@ -118,6 +119,15 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if cfg.Notify != nil {
+		watched := cfg.NotifyRepos()
+		if _, err := events.Start(ctx, log, cfg.Notify, watched, cfg.BrPath); err != nil {
+			return fmt.Errorf("notify: %w", err)
+		}
+		log.Info("notifying", "url", cfg.Notify.URL, "topic", cfg.Notify.Topic,
+			"node", cfg.Notify.Node, "repos", len(watched))
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

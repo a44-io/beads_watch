@@ -205,6 +205,17 @@ wrong answer. There is a regression test for exactly this.
 > daemon that cannot serve both at once, are each worse than the pair of
 > units. (Making `--listen` additive is part of `bw-mub`.)
 
+## Events
+
+With an opt-in `notify` block in the config, the daemon also tails every
+served repo's beads mutation log and publishes each typed event (created,
+claimed, commented, assigned, closed, …) to an ntfy topic within a second,
+tagged by event type, repo, node, and actor — plus per-agent dispatch topics
+for assignments. It replays br's own audit trail through a cursor rather than
+inferring anything, so the no-second-implementation rule holds. The full
+contract, delivery semantics, and subscriber recipes live in
+[EVENTS.md](EVENTS.md).
+
 ## Install
 
 ```bash

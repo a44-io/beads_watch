@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+
+	"beads_watch/internal/events"
 )
 
 // Repo is one beads workspace this node serves.
@@ -37,6 +39,11 @@ type Config struct {
 	// InjectJSON adds --json when the caller did not pick a format. Callers
 	// that want TOON or human text just pass --format themselves.
 	InjectJSON *bool `json:"inject_json,omitempty"`
+
+	// Notify, when present, tails every served repo's beads mutation log and
+	// publishes typed events to ntfy. Absent means the feature is off and the
+	// daemon behaves exactly as it did before events existed.
+	Notify *events.Config `json:"notify,omitempty"`
 }
 
 // DefaultAllow is the br surface reachable over the network out of the box:
@@ -167,7 +174,37 @@ func (c *Config) Normalize() error {
 			return fmt.Errorf("repo %q: %s is not a directory", r.Name, r.Path)
 		}
 	}
+
+	if c.Notify != nil {
+		if err := c.Notify.Normalize(); err != nil {
+			return fmt.Errorf("notify: %w", err)
+		}
+		for _, name := range c.Notify.Repos {
+			if _, ok := seen[name]; !ok {
+				return fmt.Errorf("notify: repo %q is not served by this daemon", name)
+			}
+		}
+	}
 	return nil
+}
+
+// NotifyRepos is the subset of served repos the notify block watches: the
+// named subset when one is given, otherwise every served repo.
+func (c *Config) NotifyRepos() []events.Repo {
+	if c.Notify == nil {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, name := range c.Notify.Repos {
+		want[name] = true
+	}
+	var out []events.Repo
+	for _, r := range c.Repos {
+		if len(want) == 0 || want[r.Name] {
+			out = append(out, events.Repo{Name: r.Name, Path: r.Path})
+		}
+	}
+	return out
 }
 
 // Timeout is the per-request br deadline.
