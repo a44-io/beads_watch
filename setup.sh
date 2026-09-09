@@ -81,6 +81,12 @@ NO_UNITS=0
 NO_START=0
 CLI_REPOS=()
 
+# Set when this run actually replaced the binary or a unit file. A running
+# daemon keeps its old executable mapped, so installing over it changes
+# nothing until something restarts it.
+BINARY_CHANGED=0
+UNITS_CHANGED=0
+
 # Where this script lives; a repo checkout if go.mod sits beside it.
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd) || HERE=$PWD
 REPO_MODE=0
@@ -527,6 +533,7 @@ install_binary() {
   fi
 
   install -m 0755 "$TMP/$BIN_NAME" "$PREFIX/$BIN_NAME" || die "could not install to $PREFIX" 1
+  BINARY_CHANGED=1
   ok "installed $("$PREFIX/$BIN_NAME" --version | head -1) → $PREFIX/$BIN_NAME"
 
   case ":$PATH:" in
@@ -658,6 +665,18 @@ setup_units() {
 
   mkdir -p "$UNIT_DIR"
 
+  # Fingerprint the units before touching them, so a re-run that changes
+  # nothing does not restart a healthy daemon for no reason.
+  units_fingerprint() {
+    local u out=""
+    for u in "$SERVICE_UNIT" "$PROXY_SOCKET" "$PROXY_SERVICE"; do
+      out+="$(cat "$UNIT_DIR/$u" 2>/dev/null || true)"
+    done
+    printf '%s' "$out" | cksum
+  }
+  local before after
+  before=$(units_fingerprint)
+
   # A previous manual install symlinks these into a checkout. Redirecting onto
   # a symlink writes THROUGH it and edits the repo's tracked unit files, so
   # clear the link first and write a real file in its place.
@@ -750,6 +769,9 @@ UNIT
     ok "wrote the bridge units ($ip:$BRIDGE_PORT)"
   fi
 
+  after=$(units_fingerprint)
+  [[ "$before" != "$after" ]] && UNITS_CHANGED=1
+
   systemctl --user daemon-reload
 
   if [[ "$NO_START" -eq 1 ]]; then
@@ -758,11 +780,26 @@ UNIT
   fi
   ask_yn "Enable and start beads_watch now?" y || { info "units left disabled"; return 0; }
 
-  systemctl --user enable --now "$SERVICE_UNIT" ||
-    warn "could not start $SERVICE_UNIT; see: journalctl --user -u beads_watch -n 30"
-  if [[ -n "$ip" ]]; then
-    systemctl --user enable --now "$PROXY_SOCKET" || warn "could not start $PROXY_SOCKET"
+  systemctl --user enable "$SERVICE_UNIT" &>/dev/null ||
+    warn "could not enable $SERVICE_UNIT"
+  [[ -n "$ip" ]] && { systemctl --user enable "$PROXY_SOCKET" &>/dev/null || warn "could not enable $PROXY_SOCKET"; }
+
+  # `enable --now` starts a stopped unit but leaves a running one alone, so on
+  # an upgrade it would report success while the OLD binary kept serving. Any
+  # real change has to restart.
+  local action=start
+  if [[ "$BINARY_CHANGED" -eq 1 || "$UNITS_CHANGED" -eq 1 ]] &&
+    systemctl --user is-active --quiet "$SERVICE_UNIT"; then
+    action=restart
+    info "restarting to pick up the new $([[ "$BINARY_CHANGED" -eq 1 ]] && echo binary || echo units)"
   fi
+
+  if [[ -n "$ip" ]]; then
+    # The socket owns the port; it has to let go before the service rebinds.
+    systemctl --user "$action" "$PROXY_SOCKET" || warn "could not $action $PROXY_SOCKET"
+  fi
+  systemctl --user "$action" "$SERVICE_UNIT" ||
+    warn "could not $action $SERVICE_UNIT; see: journalctl --user -u beads_watch -n 30"
 
   if command -v loginctl &>/dev/null; then
     if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ]]; then
@@ -790,6 +827,21 @@ verify_install() {
     return 0
   fi
   ok "health: $(printf '%s' "$body" | tr -d '\n ')"
+
+  # The check that matters on an upgrade: a daemon keeps its old executable
+  # mapped, so "installed" and "running" are different facts. Compare them.
+  local want running
+  want=$(installed_commit)
+  running=$(printf '%s' "$body" | sed -n 's/.*"commit"[: ]*"\([0-9a-f]*\)".*/\1/p')
+  if [[ -n "$want" && -n "$running" && "$want" != "$running" ]]; then
+    warn "the RUNNING daemon is ${running:0:12}, but ${want:0:12} is installed"
+    warn "  systemctl --user restart beads_watch"
+  elif [[ -n "$want" && -z "$running" ]]; then
+    warn "the running daemon reports no commit, so it predates this install"
+    warn "  systemctl --user restart beads_watch"
+  elif [[ -n "$running" ]]; then
+    ok "running commit matches the installed binary"
+  fi
 
   local ip
   ip=$(tailnet_ip)
