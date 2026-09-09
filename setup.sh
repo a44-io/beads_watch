@@ -624,6 +624,17 @@ tailnet_ip() {
   tailscale ip -4 2>/dev/null | head -1
 }
 
+# The name this node answers to. `hostname -s` is NOT it: on a box whose
+# resolver maps the name to loopback, -s returns "localhost". The daemon uses
+# os.Hostname(), which is plain `hostname`, so match that and lowercase it the
+# way the events config does.
+node_name() {
+  local n
+  n=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)
+  n=${n%%.*}
+  printf '%s' "$n" | tr '[:upper:]' '[:lower:]'
+}
+
 setup_units() {
   [[ "$NO_UNITS" -eq 1 ]] && { info "units skipped (--no-units)"; return 0; }
   phase "Units"
@@ -808,7 +819,7 @@ print_summary() {
   [[ -n "$ip" ]] && lines+=("bridge   http://$ip:$BRIDGE_PORT")
   lines+=("")
   lines+=("Name it from pi so it gets a URL:")
-  lines+=("  ssh pi caddy/expose beads-$(hostname -s) $ip:$BRIDGE_PORT")
+  lines+=("  ssh pi caddy/expose beads-$(node_name) $ip:$BRIDGE_PORT")
   lines+=("")
   lines+=("Uninstall:  setup.sh --uninstall")
   echo ""
