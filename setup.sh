@@ -787,19 +787,33 @@ UNIT
   # `enable --now` starts a stopped unit but leaves a running one alone, so on
   # an upgrade it would report success while the OLD binary kept serving. Any
   # real change has to restart.
-  local action=start
+  local restarting=0
   if [[ "$BINARY_CHANGED" -eq 1 || "$UNITS_CHANGED" -eq 1 ]] &&
     systemctl --user is-active --quiet "$SERVICE_UNIT"; then
-    action=restart
+    restarting=1
     info "restarting to pick up the new $([[ "$BINARY_CHANGED" -eq 1 ]] && echo binary || echo units)"
   fi
 
-  if [[ -n "$ip" ]]; then
-    # The socket owns the port; it has to let go before the service rebinds.
-    systemctl --user "$action" "$PROXY_SOCKET" || warn "could not $action $PROXY_SOCKET"
+  # A .socket refuses to start while the service it activates is still running
+  # ("Socket service ... already active, refusing"), so restarting the socket
+  # on its own takes the bridge down and leaves it down. The pair has to come
+  # down together and go back up socket first, with the proxy service left for
+  # the socket to trigger on the next connection.
+  if [[ "$restarting" -eq 1 && -n "$ip" ]]; then
+    systemctl --user stop "$PROXY_SOCKET" "$PROXY_SERVICE" &>/dev/null || true
   fi
-  systemctl --user "$action" "$SERVICE_UNIT" ||
-    warn "could not $action $SERVICE_UNIT; see: journalctl --user -u beads_watch -n 30"
+
+  if [[ "$restarting" -eq 1 ]]; then
+    systemctl --user restart "$SERVICE_UNIT" ||
+      warn "could not restart $SERVICE_UNIT; see: journalctl --user -u beads_watch -n 30"
+  else
+    systemctl --user start "$SERVICE_UNIT" ||
+      warn "could not start $SERVICE_UNIT; see: journalctl --user -u beads_watch -n 30"
+  fi
+
+  if [[ -n "$ip" ]]; then
+    systemctl --user start "$PROXY_SOCKET" || warn "could not start $PROXY_SOCKET"
+  fi
 
   if command -v loginctl &>/dev/null; then
     if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ]]; then
@@ -845,11 +859,16 @@ verify_install() {
 
   local ip
   ip=$(tailnet_ip)
-  if [[ -n "$ip" ]] && curl -s --max-time 3 "http://$ip:$BRIDGE_PORT/v1/health" >/dev/null 2>&1; then
-    ok "bridge: http://$ip:$BRIDGE_PORT reachable"
-  elif [[ -n "$ip" ]]; then
-    warn "bridge on $ip:$BRIDGE_PORT did not answer"
-  fi
+  [[ -n "$ip" ]] || return 0
+  for i in 1 2 3; do
+    if curl -s --max-time 3 "http://$ip:$BRIDGE_PORT/v1/health" >/dev/null 2>&1; then
+      ok "bridge: http://$ip:$BRIDGE_PORT reachable"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "bridge on $ip:$BRIDGE_PORT did not answer"
+  warn "  systemctl --user status $PROXY_SOCKET"
 }
 
 # ── Uninstall ───────────────────────────────────────────────────────────────

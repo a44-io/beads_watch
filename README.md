@@ -29,11 +29,11 @@ Every command below is a real transcript against a running daemon.
 
 ```console
 $ curl -s --unix-socket /run/user/1000/beads_watch.sock http://local/v1/health
-{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.2" }
+{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.3" }
 
 # or over the tailnet, through caddy
 $ curl -s https://beads-dev.dev.a44.io/v1/health
-{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.2" }
+{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.3" }
 ```
 
 Run a `br` subcommand in a named repo. The body is `br`'s stdout, unchanged:
@@ -112,7 +112,7 @@ client can always tell that *this daemon* answered, and which box it was.
 Liveness. Runs no `br`, so it stays up even when a repo is broken.
 
 ```json
-{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.2" }
+{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.3" }
 ```
 
 ### `GET /v1/repos`
@@ -436,7 +436,7 @@ the release traceable:
 
 ```console
 $ beads_watch --version
-beads_watch 1.0.2
+beads_watch 1.0.3
 commit: 923ce5017418018c3ff1f0113d91dfefca1ce58e
 built:  2026-09-09T13:17:48Z
 ```

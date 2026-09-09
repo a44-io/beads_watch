@@ -19,7 +19,7 @@ import (
 
 // Version is stamped on every response so a client can tell which daemon
 // answered without a separate round trip.
-const Version = "1.0.2"
+const Version = "1.0.3"
 
 // Commit and BuiltAt are stamped at link time by scripts/publish-dist.sh:
 //
