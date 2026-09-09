@@ -351,7 +351,12 @@ validates every repo path without binding anything:
 beads_watch --print-config
 ```
 
-Run it under systemd. The units in `systemd/` are made to be symlinked:
+Run it under systemd. The units in `systemd/` are made to be symlinked, and
+carry arch's tailnet address, so a different box needs a drop-in to override
+`ListenStream`. `setup.sh` exists partly to avoid that: it generates the units
+with the local address already in them. If you wire it up by hand and later run
+`setup.sh`, it replaces the symlinks with real files and moves any drop-in
+aside, keeping a timestamped backup.
 
 ```bash
 ln -s ~/dev/beads_watch/systemd/beads_watch.service \
