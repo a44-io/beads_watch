@@ -658,6 +658,31 @@ setup_units() {
 
   mkdir -p "$UNIT_DIR"
 
+  # A previous manual install symlinks these into a checkout. Redirecting onto
+  # a symlink writes THROUGH it and edits the repo's tracked unit files, so
+  # clear the link first and write a real file in its place.
+  local unit
+  for unit in "$SERVICE_UNIT" "$PROXY_SOCKET" "$PROXY_SERVICE"; do
+    if [[ -L "$UNIT_DIR/$unit" ]]; then
+      info "replacing symlinked $unit (was → $(readlink "$UNIT_DIR/$unit"))"
+      rm -f "$UNIT_DIR/$unit"
+    fi
+  done
+
+  # Drop-ins outrank the unit file. The one this installer's predecessor needed
+  # exists to patch ListenStream onto a unit that hardcoded another box's IP,
+  # which is exactly what generating the unit per box makes unnecessary. Left
+  # in place it would silently override the address written below, so --port
+  # would not do what it says.
+  local dropin
+  for unit in "$SERVICE_UNIT" "$PROXY_SOCKET" "$PROXY_SERVICE"; do
+    dropin="$UNIT_DIR/$unit.d"
+    if [[ -d "$dropin" ]]; then
+      mv "$dropin" "$dropin.bak.$(date +%Y%m%d%H%M%S)"
+      warn "moved aside $unit.d (its overrides would outrank the generated unit)"
+    fi
+  done
+
   cat >"$UNIT_DIR/$SERVICE_UNIT" <<UNIT
 [Unit]
 Description=beads_watch — serve br over the tailnet
