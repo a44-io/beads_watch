@@ -66,6 +66,16 @@ func run() error {
 
 	if *showVersion {
 		fmt.Println("beads_watch " + server.Version)
+		// Machine-read by scripts/publish-dist.sh and setup.sh, which compare
+		// this against the commit they are about to publish or install. Printed
+		// only when stamped, so an unstamped source build stays silent about a
+		// commit it does not know.
+		if server.Commit != "" {
+			fmt.Println("commit: " + server.Commit)
+		}
+		if server.BuiltAt != "" {
+			fmt.Println("built:  " + server.BuiltAt)
+		}
 		return nil
 	}
 

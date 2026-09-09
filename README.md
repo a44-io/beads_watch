@@ -19,7 +19,7 @@ predicates had quietly diverged. This daemon cannot develop that bug.
 
 **Contents**: [Quick example](#quick-example) · [Architecture](#architecture) ·
 [API](#api) · [Identity](#identity) · [Security](#security) ·
-[Events](#events) · [Install](#install) · [CLI](#cli) ·
+[Events](#events) · [Install](#install) · [Releases](#releases) · [CLI](#cli) ·
 [Configuration](#configuration) · [Troubleshooting](#troubleshooting) ·
 [Limitations](#limitations) · [FAQ](#faq)
 
@@ -300,12 +300,34 @@ The full contract, delivery semantics, and subscriber recipes live in
 
 ## Install
 
-Needs Go 1.24+ and `br` on `PATH`. The tailnet path also needs tailscale and a
-caddy host. The module is not published for `go install`; build from a clone:
+From any tailnet box, one line. The cache buster matters, because dufs and
+caddy will each happily hand you yesterday's copy:
+
+```bash
+curl -fsSL "https://bw.dev.a44.io/setup.sh?$(date +%s)" | bash
+```
+
+That installs a prebuilt binary matching the served commit, discovers the
+`.beads` workspaces on the box, writes the config, generates the systemd units
+with this box's own tailnet address, starts it, and health-checks all of it.
+`--yes` takes every default for an unattended run; `--dry-run` prints the plan
+and changes nothing; `--uninstall` reverses it and keeps every `.beads`. See
+[Releases](#releases) for what is being served and how it gets there.
+
+Needs `br` on `PATH`, plus tailscale for the bridge. It falls back to building
+from source when no prebuilt matches the box, which needs Go 1.24+.
+
+From a clone instead, which skips the fileserver entirely:
 
 ```bash
 git clone https://github.com/a44-io/beads_watch.git
 cd beads_watch
+./setup.sh          # same installer, building from this checkout
+```
+
+Or by hand, if you would rather wire it up yourself:
+
+```bash
 go build -o ~/.local/bin/beads_watch .
 beads_watch --version
 ```
@@ -361,6 +383,67 @@ curl -s --unix-socket /run/user/1000/beads_watch.sock http://local/v1/health
 curl -s "$(tailscale ip -4 | head -1):8438/v1/health"
 curl -s https://beads-<node>.dev.a44.io/v1/health
 ```
+
+## Releases
+
+Artifacts are private and live on the tailnet fileserver, never on GitHub. A
+dufs instance on pi serves `/srv/ice/.bw`, caddy fronts it as
+`https://bw.dev.a44.io` under the wildcard cert, and the tailnet ACL is the
+authenticity boundary. There is no signing step because there is no public
+pipeline to sign against; `manifest.json` carries a sha256 for every file and
+`setup.sh` refuses anything that does not match.
+
+Publish from a clean checkout:
+
+```bash
+scripts/publish-dist.sh --url https://bw.dev.a44.io --push pi:/srv/ice/.bw/
+```
+
+Cut a tagged release, which records the tag in the manifest and pushes it:
+
+```bash
+scripts/publish-dist.sh --tag v0.2.0 --push-tag \
+  --url https://bw.dev.a44.io --push pi:/srv/ice/.bw/
+```
+
+It refuses to publish from a dirty tree, because the bundle it builds is `HEAD`
+and uncommitted changes would silently not be what gets served. `--allow-dirty`
+overrides that and marks `"dirty": true` in the manifest, which `setup.sh`
+warns about on the way in.
+
+What lands on the fileserver:
+
+| File | What it is |
+|---|---|
+| `setup.sh` | the installer, with its `DEFAULT_DIST_URL` stamped in so a bare `curl \| bash` needs no environment |
+| `beads_watch.bundle` | `git bundle` of the branch. A clone from it keeps full history, so a consumer that has to build from source can still stamp its own commit |
+| `bin/beads_watch-<os>-<arch>.tar.gz` | prebuilt, `CGO_ENABLED=0`. Static, so it does not carry the publishing box's glibc to a consumer |
+| `manifest.json` | commit, tag, version, and sha256 for everything above |
+
+One box publishes for the whole fleet: the default targets are
+`linux/amd64,linux/arm64`, and `--targets` takes any GOOS/GOARCH list.
+
+Inspect what is being served without installing it:
+
+```bash
+dfm --server=bw view manifest.json
+dfm --server=bw ls
+curl -s https://bw.dev.a44.io/manifest.json | jq '{commit, tag, generated_at}'
+```
+
+A published binary reports the commit it was built from, which is what makes
+the release traceable:
+
+```console
+$ beads_watch --version
+beads_watch 0.1.0
+commit: 923ce5017418018c3ff1f0113d91dfefca1ce58e
+built:  2026-09-09T13:17:48Z
+```
+
+`GET /v1/health` grows a `commit` field on a published binary too. A source
+build reports neither, which is the honest answer rather than a guess:
+unstamped code cannot say which commit it is.
 
 ## CLI
 
@@ -513,8 +596,9 @@ to check.
 - **No `-C` flag in `br` 0.2.22.** Repos are targeted by setting the child's
   working directory, so anything that changes how `br` walks up from cwd
   changes what the daemon serves.
-- **Not packaged.** No release binaries, no package manager, no installer;
-  clone and `go build`.
+- **Releases are tailnet-only.** Artifacts live on the private fileserver, not
+  on GitHub, so `curl | bash` works from a tailnet box and nowhere else. There
+  is no package manager and no public download.
 
 ## FAQ
 

@@ -21,6 +21,19 @@ import (
 // answered without a separate round trip.
 const Version = "0.1.0"
 
+// Commit and BuiltAt are stamped at link time by scripts/publish-dist.sh:
+//
+//	go build -ldflags "-X beads_watch/internal/server.Commit=$(git rev-parse HEAD)"
+//
+// A source build leaves them empty, which is the honest answer: an unstamped
+// binary cannot say which commit it came from. The publisher relies on this to
+// tell an already-current binary from one that must be rebuilt, and setup.sh
+// relies on it to skip reinstalling a binary that is already the served commit.
+var (
+	Commit  string
+	BuiltAt string
+)
+
 // maxRequestBody bounds the argv document. Nothing legitimate is large.
 const maxRequestBody = 64 << 10
 
@@ -146,12 +159,19 @@ func (s *Server) identify(ctx context.Context, r *http.Request, requested string
 // --- handlers -------------------------------------------------------------
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"ok":      true,
 		"node":    s.node,
 		"version": Version,
 		"repos":   len(s.cfg.Repos),
-	})
+	}
+	// Only present on a published binary. Absent means a source build, which
+	// is a real distinction: it says the running code was never stamped, so
+	// no commit can be claimed for it.
+	if Commit != "" {
+		body["commit"] = Commit
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // handleWhoami reports exactly which identity headers arrived. Tagged devices
