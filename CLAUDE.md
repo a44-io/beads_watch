@@ -32,7 +32,6 @@ Beads provides a lightweight, dependency-aware issue database and a CLI (`br`) f
 ```bash
 # Essentials
 br create "Title" --description "..."      # Create an issue
-br update <id> --acceptance-criteria "..." # Add or update acceptance criteria
 br update <id> --claim --json              # Claim work
 br comments add <id> --message "..."       # Add comments
 br close <id> --reason "..."               # Complete
@@ -74,6 +73,10 @@ Use this rule of thumb:
 
 ### Best Practices
 
+- Beads are for **agent-ready implementation work**
+- Living artifacts (docs, vision, decision records) are a single bead with
+  `--status pinned --type docs`, updated with comments
+- Use `--type question` when blocked mid-work
 - Use `--json` to get structured output for parsing
 - Check `br ready` at session start to find available work
 - Update status as you work (in_progress → closed)
