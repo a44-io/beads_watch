@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -19,7 +21,7 @@ import (
 
 // Version is stamped on every response so a client can tell which daemon
 // answered without a separate round trip.
-const Version = "1.0.3"
+const Version = "1.1.0"
 
 // Commit and BuiltAt are stamped at link time by scripts/publish-dist.sh:
 //
@@ -94,9 +96,50 @@ func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// --- transport ------------------------------------------------------------
+
+// Transport is what the listener knew about a connection before a byte of
+// any request arrived: which listener it came in on and, for TCP, the peer's
+// address. Trust is decided on this and nothing else — the peer cannot change
+// mid-connection and nothing in a request can forge it — which is what makes
+// forwarded identity headers safe to believe from a proxy and safe to ignore
+// from anyone else.
+type Transport struct {
+	// Network is "tcp" or "unix"; empty when the request did not arrive
+	// through a listener this daemon tagged (tests, mainly), which is treated
+	// as the least trusted case.
+	Network string `json:"network"`
+	// Peer is the TCP peer's address, absent on the unix socket.
+	Peer string `json:"peer,omitempty"`
+	// TrustedProxy is whether Peer is in trusted_proxies, so its forwarded
+	// identity headers are believed.
+	TrustedProxy bool `json:"trusted_proxy"`
+
+	addr netip.Addr
+}
+
+type transportKey struct{}
+
+// ConnContext tags each accepted connection with its Transport. It is meant
+// for http.Server.ConnContext, and every request on the connection sees it.
+func (s *Server) ConnContext(ctx context.Context, c net.Conn) context.Context {
+	t := Transport{Network: c.RemoteAddr().Network()}
+	if ap, err := netip.ParseAddrPort(c.RemoteAddr().String()); err == nil {
+		t.addr = ap.Addr().Unmap()
+		t.Peer = t.addr.String()
+		t.TrustedProxy = s.cfg.TrustedProxy(t.addr)
+	}
+	return context.WithValue(ctx, transportKey{}, t)
+}
+
+func transportOf(ctx context.Context) Transport {
+	t, _ := ctx.Value(transportKey{}).(Transport)
+	return t
+}
+
 // --- identity -------------------------------------------------------------
 
-// Identity is what the proxy told us about the caller. Absent identity is
+// Identity is what the transport told us about the caller. Absent identity is
 // represented honestly rather than filled in with a guess: an invented actor
 // in the audit trail is worse than a missing one.
 type Identity struct {
@@ -104,56 +147,90 @@ type Identity struct {
 	// this stays empty for them no matter how the request arrived.
 	Login string `json:"login,omitempty"`
 	Name  string `json:"name,omitempty"`
-	// Peer is the calling machine, resolved via WhoIs from the proxy's
-	// X-Forwarded-For.
+	// Peer is the calling machine, resolved via WhoIs — from the trusted
+	// proxy's X-Forwarded-For, or from the TCP peer itself.
 	Peer *tsidentity.Peer `json:"peer,omitempty"`
 	// Actor is what lands in BD_ACTOR; empty means br uses its own default.
 	Actor string `json:"actor"`
 	// Source records how Actor was determined, so a reader of the audit trail
-	// knows whether it was verified by the transport or merely claimed.
+	// knows whether it was verified by the transport or merely claimed:
+	// tailscale-user-header and tailscale-whois came through a trusted proxy,
+	// tailscale-whois-direct is the TCP peer resolved by its own address,
+	// request is self-asserted, none is nothing at all.
 	Source string `json:"source"`
-	// Verified is true when the proxy vouched for Actor, false when the caller
-	// asserted it themselves.
+	// Verified is true when the transport vouched for Actor, false when the
+	// caller asserted it themselves.
 	Verified bool `json:"verified"`
 }
 
-// identify resolves the caller, most trustworthy signal first.
+// identify resolves the caller, most trustworthy signal first. Which signals
+// exist at all is decided by the transport: forwarded headers are the proxy's
+// word only when the connection actually came from a trusted proxy. From any
+// other TCP peer they are that peer's own claim and are not read; the peer's
+// address is resolved instead, so a direct caller gets a correct verified
+// identity — its own machine — rather than whatever it typed. On the unix
+// socket nothing can vouch for a header, so only the body's actor counts.
 func (s *Server) identify(ctx context.Context, r *http.Request, requested string) Identity {
 	id := Identity{Source: "none"}
-	id.Login = strings.TrimSpace(r.Header.Get("Tailscale-User-Login"))
-	id.Name = strings.TrimSpace(r.Header.Get("Tailscale-User-Name"))
+	tr := transportOf(ctx)
 
-	// 1. The proxy names a user. It strips this header when a client sends it,
-	//    so its presence means tailscaled put it there.
-	if id.Login != "" {
-		id.Actor, id.Source, id.Verified = id.Login, "tailscale-user-header", true
-		return id
-	}
+	switch {
+	case tr.TrustedProxy:
+		id.Login = strings.TrimSpace(r.Header.Get("Tailscale-User-Login"))
+		id.Name = strings.TrimSpace(r.Header.Get("Tailscale-User-Name"))
 
-	// 2. No user header — the usual case for tagged devices, which have no
-	//    owning user. The proxy still tells us which machine called, and it
-	//    replaces rather than appends X-Forwarded-For, so that address is
-	//    its own view of the peer and not the caller's claim.
-	if addr := tsidentity.PeerAddr(r.Header.Get("X-Forwarded-For")); addr != "" {
-		if peer, err := s.resolver.WhoIs(ctx, addr); err == nil && peer != nil {
+		// 1. The proxy names a user. It strips this header when a client
+		//    sends it, so its presence means the proxy put it there.
+		if id.Login != "" {
+			id.Actor, id.Source, id.Verified = id.Login, "tailscale-user-header", true
+			return id
+		}
+
+		// 2. No user header — the usual case for tagged devices, which have
+		//    no owning user. The proxy still tells us which machine called:
+		//    it appends its own view of the peer to X-Forwarded-For, and
+		//    PeerAddr takes the last entry, so a caller's forged prefix loses.
+		if addr := tsidentity.PeerAddr(r.Header.Get("X-Forwarded-For")); addr != "" {
+			if peer := s.whois(ctx, addr); peer != nil {
+				id.Peer = peer
+				if a := peer.Actor(); a != "" {
+					id.Actor, id.Source, id.Verified = a, "tailscale-whois", true
+					return id
+				}
+			}
+		}
+
+	case tr.Network == "tcp" && tr.addr.IsValid():
+		// A peer that reached the TCP listener itself. Its headers are its
+		// own claims; its address is the transport's fact, so that is what
+		// gets resolved.
+		if peer := s.whois(ctx, tr.addr.String()); peer != nil {
 			id.Peer = peer
 			if a := peer.Actor(); a != "" {
-				id.Actor, id.Source, id.Verified = a, "tailscale-whois", true
+				id.Actor, id.Source, id.Verified = a, "tailscale-whois-direct", true
 				return id
 			}
-		} else if err != nil {
-			s.log.Debug("whois failed", "addr", addr, "err", err)
 		}
 	}
 
-	// 3. Self-asserted. Useful for local callers that never traverse the
-	//    proxy, and marked unverified so the distinction survives.
+	// 3. Self-asserted. The only signal on the unix socket, and the fallback
+	//    when a TCP peer is not a tailnet node; marked unverified so the
+	//    distinction survives into the audit trail.
 	if requested = strings.TrimSpace(requested); requested != "" {
 		id.Actor, id.Source, id.Verified = requested, "request", false
 		return id
 	}
 
 	return id
+}
+
+func (s *Server) whois(ctx context.Context, addr string) *tsidentity.Peer {
+	peer, err := s.resolver.WhoIs(ctx, addr)
+	if err != nil {
+		s.log.Debug("whois failed", "addr", addr, "err", err)
+		return nil
+	}
+	return peer
 }
 
 // --- handlers -------------------------------------------------------------
@@ -208,6 +285,7 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"identity":              id,
+		"transport":             transportOf(r.Context()),
 		"user_header_forwarded": len(forwarded) > 0,
 		"tailscale_headers":     forwarded,
 		"peer_addr":             tsidentity.PeerAddr(r.Header.Get("X-Forwarded-For")),

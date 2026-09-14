@@ -1,6 +1,6 @@
-// Command beads_watch serves the br CLI over HTTP on a unix socket, so any
-// machine on the tailnet can read and write beads through `tailscale serve`
-// without ssh.
+// Command beads_watch serves the br CLI over HTTP — on a unix socket for
+// local callers and on this box's tailnet address for the reverse proxy — so
+// any machine on the tailnet can read and write beads without ssh.
 //
 // It is a pipe to br. It does not model issues, cache results, or maintain a
 // projection — so `br ready` over HTTP is correct by construction, and a br
@@ -55,7 +55,7 @@ func run() error {
 	var (
 		configPath  = flag.String("config", "", "config file (default "+server.DefaultConfigPath()+")")
 		socketPath  = flag.String("socket", "", "unix socket to listen on (overrides config)")
-		listenAddr  = flag.String("listen", "", "listen on a TCP address (e.g. 127.0.0.1:7717) instead of a unix socket")
+		listenAddr  = flag.String("listen", "", "TCP address to listen on as well, e.g. 127.0.0.1:7717 (overrides config; without a socket this is TCP only)")
 		timeout     = flag.Int("timeout", 0, "per-request br timeout in seconds (overrides config)")
 		printConfig = flag.Bool("print-config", false, "print the effective config and exit")
 		showVersion = flag.Bool("version", false, "print version and exit")
@@ -79,17 +79,25 @@ func run() error {
 		return nil
 	}
 
-	cfg, err := loadConfig(*configPath, repos)
+	cfg, source, err := loadConfig(*configPath, repos)
 	if err != nil {
 		return err
 	}
 	if *socketPath != "" {
 		cfg.Socket = *socketPath
 	}
+	if *listenAddr != "" {
+		cfg.Listen = *listenAddr
+	}
 	if *timeout > 0 {
 		cfg.TimeoutSeconds = *timeout
 	}
+	// Once, after every override: the socket default depends on whether a
+	// TCP address ended up set, so this cannot happen inside LoadConfig.
 	if err := cfg.Normalize(); err != nil {
+		if source != "" {
+			return fmt.Errorf("%s: %w", source, err)
+		}
 		return err
 	}
 
@@ -113,29 +121,38 @@ func run() error {
 		return enc.Encode(cfg)
 	}
 
-	// A unix socket is the preferred transport: mode 0600 keeps every other
-	// local user out, which matters on a box running agent swarms. TCP exists
-	// because `tailscale serve` needs root to proxy a unix socket but not a
-	// localhost port; the cost is that any local process can reach it.
+	// Two listeners, one server. The unix socket is the local path: mode 0600
+	// keeps every other local user out, which matters on a box running agent
+	// swarms. The TCP address is the tailnet path: the reverse proxy reaches
+	// it directly, and because the daemon owns the socket it sees the real
+	// peer, which is what lets it tell the proxy from anyone else.
 	var (
-		ln   net.Listener
-		addr string
+		lns   []net.Listener
+		addrs []string
 	)
-	if *listenAddr != "" {
-		if ln, err = net.Listen("tcp", *listenAddr); err != nil {
+	if cfg.Socket != "" {
+		ln, err := server.ListenSocket(cfg.Socket)
+		if err != nil {
 			return err
 		}
-		addr = *listenAddr
-	} else {
-		if ln, err = listenSocket(cfg.Socket); err != nil {
-			return err
-		}
-		addr = cfg.Socket
 		defer os.Remove(cfg.Socket)
+		lns, addrs = append(lns, ln), append(addrs, cfg.Socket)
+	}
+	if cfg.Listen != "" {
+		ln, err := server.ListenTCP(cfg.Listen)
+		if err != nil {
+			for _, l := range lns {
+				l.Close()
+			}
+			return err
+		}
+		lns, addrs = append(lns, ln), append(addrs, cfg.Listen)
 	}
 
+	handler := server.New(cfg, log)
 	srv := &http.Server{
-		Handler:           server.New(cfg, log).Handler(),
+		Handler:           handler.Handler(),
+		ConnContext:       handler.ConnContext,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -151,16 +168,23 @@ func run() error {
 			"node", cfg.Notify.Node, "repos", len(watched))
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.Serve(ln)
-	}()
+	// One error slot per listener: Serve returns on each when Shutdown closes
+	// them, and the buffer keeps the late ones from blocking a goroutine.
+	errCh := make(chan error, len(lns))
+	for _, ln := range lns {
+		go func(ln net.Listener) {
+			errCh <- srv.Serve(ln)
+		}(ln)
+	}
 
 	names := make([]string, len(cfg.Repos))
 	for i, r := range cfg.Repos {
 		names[i] = r.Name
 	}
-	attrs := []any{"addr", addr, "repos", strings.Join(names, ","), "version", server.Version}
+	attrs := []any{"addr", strings.Join(addrs, ","), "repos", strings.Join(names, ","), "version", server.Version}
+	if len(cfg.TrustedProxies) > 0 {
+		attrs = append(attrs, "trusted_proxies", strings.Join(cfg.TrustedProxies, ","))
+	}
 	if len(unavailable) > 0 {
 		bad := make([]string, len(unavailable))
 		for i, r := range unavailable {
@@ -185,49 +209,21 @@ func run() error {
 }
 
 // loadConfig prefers explicit --repo flags, then the named config file, then
-// the default config path.
-func loadConfig(path string, repos repoFlag) (*server.Config, error) {
+// the default config path. source names the file the config came from, or is
+// empty for --repo, so a validation error can say which file it is about.
+func loadConfig(path string, repos repoFlag) (cfg *server.Config, source string, err error) {
 	if len(repos) > 0 {
-		return &server.Config{Repos: []server.Repo(repos)}, nil
+		return &server.Config{Repos: []server.Repo(repos)}, "", nil
 	}
 	if path == "" {
 		path = server.DefaultConfigPath()
 		if path == "" {
-			return nil, errors.New("no config file and no --repo flags; nothing to serve")
+			return nil, "", errors.New("no config file and no --repo flags; nothing to serve")
 		}
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("no config at %s and no --repo flags; nothing to serve", path)
+			return nil, "", fmt.Errorf("no config at %s and no --repo flags; nothing to serve", path)
 		}
 	}
-	return server.LoadConfig(path)
-}
-
-// listenSocket binds the unix socket, refusing to steal it from a live daemon
-// but clearing it when the previous process died without cleaning up.
-func listenSocket(path string) (net.Listener, error) {
-	if _, err := os.Stat(path); err == nil {
-		conn, derr := net.DialTimeout("unix", path, time.Second)
-		if derr == nil {
-			conn.Close()
-			return nil, fmt.Errorf("another beads_watch is already listening on %s", path)
-		}
-		// Nothing accepting: a stale socket from a killed process.
-		if err := os.Remove(path); err != nil {
-			return nil, fmt.Errorf("removing stale socket %s: %w", path, err)
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, err
-	}
-	// tailscaled proxies to this socket as root, which is unaffected by mode
-	// bits; 0600 keeps every other local user out.
-	if err := os.Chmod(path, 0o600); err != nil {
-		ln.Close()
-		return nil, err
-	}
-	return ln, nil
+	cfg, err = server.LoadConfig(path)
+	return cfg, path, err
 }

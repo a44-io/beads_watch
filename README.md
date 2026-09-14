@@ -29,11 +29,11 @@ Every command below is a real transcript against a running daemon.
 
 ```console
 $ curl -s --unix-socket /run/user/1000/beads_watch.sock http://local/v1/health
-{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.3" }
+{ "node": "dev", "ok": true, "repos": 5, "version": "1.1.0" }
 
 # or over the tailnet, through caddy
 $ curl -s https://beads-dev.dev.a44.io/v1/health
-{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.3" }
+{ "node": "dev", "ok": true, "repos": 5, "version": "1.1.0" }
 ```
 
 Run a `br` subcommand in a named repo. The body is `br`'s stdout, unchanged:
@@ -79,26 +79,26 @@ any tailnet machine / phone
    │  https://beads-arch.dev.a44.io
    ▼
 caddy on pi          wildcard *.dev.a44.io cert (DNS-01), tailnet-bound
-   │  reverse_proxy 100.110.83.42:8438
+   │  reverse_proxy 100.110.83.42:8438      (a trusted proxy: its headers count)
    ▼
-systemd-socket-proxyd   (beads_watch-proxy.socket, tailscale IP only)
-   │  →  unix:/run/user/1000/beads_watch.sock
-   ▼
-beads_watch
+beads_watch          listen 100.110.83.42:8438 (tailscale IP only)
+   │                 + unix:/run/user/1000/beads_watch.sock, 0600, for local callers
    │  exec: br <args...>   (cwd = repo, hostile env scrubbed)
    ▼
 .beads/
 ```
 
 Caddy on pi does the transport: HTTPS with a real wildcard cert, listening
-only on the tailnet address. On each serving box a `systemd-socket-proxyd`
-bridge accepts TCP on that box's tailscale IP and forwards to the 0600 unix
-socket, so the daemon itself still writes zero networking, zero auth, zero
-TLS. (`tailscale serve` used to play caddy's role; the caddy names are
-stable, cover every box under one cert, and don't need root on the box.)
+only on the tailnet address. On each serving box the daemon binds that box's
+own tailscale IP, so caddy reaches it directly and the daemon sees the real
+peer of every connection — which is what lets it believe caddy's forwarded
+identity and nobody else's. The daemon still writes zero auth and zero TLS.
+(`tailscale serve` used to play caddy's role, and a `systemd-socket-proxyd`
+bridge used to sit between caddy and the socket; the bridge erased the peer,
+which is why it is gone.)
 
 When repos live on other machines, there is still no hub to build. Each
-machine runs this same binary behind its own bridge, and caddy names it
+machine runs this same binary on its own address, and caddy names it
 `beads-<node>.dev.a44.io`: `beads-arch`, `beads-dev`, and so on. **The
 caddy sites directory is the directory.**
 
@@ -112,7 +112,7 @@ client can always tell that *this daemon* answered, and which box it was.
 Liveness. Runs no `br`, so it stays up even when a repo is broken.
 
 ```json
-{ "node": "dev", "ok": true, "repos": 5, "version": "1.0.3" }
+{ "node": "dev", "ok": true, "repos": 5, "version": "1.1.0" }
 ```
 
 `repos` counts every configured repo, including any whose path is not usable
@@ -155,14 +155,19 @@ to settle the question by observation instead of assumption:
 ```json
 {
   "identity": { "actor": "dev", "source": "tailscale-whois", "verified": true },
+  "transport": { "network": "tcp", "peer": "100.79.209.73", "trusted_proxy": true },
   "tailscale_headers": {},
   "user_header_forwarded": false,
   "peer_addr": "100.70.239.127",
-  "remote_addr": "@"
+  "remote_addr": "100.79.209.73:41022"
 }
 ```
 
-Reach for it first whenever a write lands under the wrong `created_by`.
+`transport` is what the listener knew before any header arrived: which
+listener the connection came in on, the TCP peer, and whether that peer is
+in `trusted_proxies`. Identity is decided from it; see [Identity](#identity).
+Reach for this endpoint first whenever a write lands under the wrong
+`created_by`.
 
 ### `POST /v1/repos/{repo}/br`
 
@@ -178,7 +183,7 @@ The response body is `br`'s stdout, unmodified. Metadata rides in headers:
 | `X-Br-Repo` | the repo that ran |
 | `X-Br-Duration-Ms` | how long `br` took |
 | `X-Br-Actor` | what `BD_ACTOR` was set to, if anything |
-| `X-Br-Actor-Source` | `tailscale-user-header`, `tailscale-whois`, `request`, or `none` |
+| `X-Br-Actor-Source` | `tailscale-user-header`, `tailscale-whois`, `tailscale-whois-direct`, `request`, or `none` |
 | `X-Br-Actor-Verified` | whether the transport vouched for the actor |
 | `X-Br-Stderr` | base64 of `br`'s stderr, when non-empty |
 | `X-Br-Stdout-Truncated` | set when output hit the size cap |
@@ -237,31 +242,55 @@ disappears is refused rather than handed to `br` to fail on `chdir`.
 
 ## Identity
 
-`BD_ACTOR` is set per request from what the proxy says about the caller, so the
-audit trail records who did what from where.
+`BD_ACTOR` is set per request from what the transport says about the caller,
+so the audit trail records who did what from where.
 
-Resolution order:
+Trust is decided per *connection*, before any header is read. The daemon
+owns its listeners, so it knows which one a connection arrived on and, on
+TCP, the peer's real address; nothing in a request can change either. That
+splits callers into three cases:
 
-1. **`Tailscale-User-Login`**: the proxy must *strip* a client-supplied
-   copy, so its presence means the proxy itself put it there. `tailscale
-   serve` does this natively; caddy does not, so the beads site files carry
-   an explicit `header_up -Tailscale-User-Login`. Without it, any tailnet
-   caller can forge a verified actor (demonstrated live, then fixed).
-2. **WhoIs on `X-Forwarded-For`**: the daemon takes the *last* entry, which
-   is the proxy's own view of the peer. Caddy *appends* its observed client
-   address, so a caller's forged prefix loses; `tailscale serve` *replaces*
-   the header outright. Either way the address that wins is
-   transport-observed, then resolved with `tailscale whois`.
+- **A trusted proxy** (its address is in `trusted_proxies`; on this tailnet,
+  caddy on pi). Its forwarded headers are its own word, and are read in
+  order:
+  1. **`Tailscale-User-Login`**: the proxy must *strip* a client-supplied
+     copy, so its presence means the proxy itself put it there. `tailscale
+     serve` does this natively; caddy does not, so the beads site files
+     carry an explicit `header_up -Tailscale-User-Login`. Without it, any
+     tailnet caller could forge a verified actor through caddy.
+  2. **WhoIs on `X-Forwarded-For`**: the daemon takes the *last* entry, which
+     is the proxy's own view of the peer. Caddy *appends* its observed client
+     address, so a caller's forged prefix loses; `tailscale serve` *replaces*
+     the header outright. Either way the address that wins is
+     transport-observed, then resolved with `tailscale whois`.
+- **Any other TCP peer** — a caller that reaches `:8438` directly. Its
+  headers are its own claims and are not read at all. Its *address* is the
+  transport's fact, so that is what gets resolved, and it lands in the audit
+  trail as its own machine: `source: tailscale-whois-direct`, `verified:
+  true`. A forged `Tailscale-User-Login: attacker@evil.com` or a forged
+  `X-Forwarded-For` appears nowhere in the identity.
+- **The unix socket.** Nothing there can vouch for a header, so forwarded
+  headers are ignored and only the request body counts.
+
+Then, for every case:
+
 3. **`actor` in the request body**: self-asserted, recorded as unverified.
+   The only signal on the socket, and the fallback when a direct TCP peer
+   is not a tailnet node (`127.0.0.1` in a `--listen` trial, say).
 4. **Nothing**: `BD_ACTOR` is left unset and `br` uses its own default.
 
-All three proxy behaviours were verified by experiment (tailscale 1.98.9;
-caddy via the live `beads-arch.dev.a44.io` chain), not assumed. A request
-from `dev` through caddy resolves to `actor: dev`, `source:
-tailscale-whois`, `verified: true`, and one carrying a forged
-`Tailscale-User-Login: attacker@evil.com` or `X-Forwarded-For: 9.9.9.9`
-still does. A caller that reaches the bridge port directly, skipping caddy,
-can still assert either header unchallenged; see [Limitations](#limitations).
+The proxy behaviours were verified by experiment (tailscale 1.98.9; caddy via
+the live `beads-arch.dev.a44.io` chain), not assumed, and the direct-peer
+rule has unit tests against a fake `tailscale whois`. A request from `dev`
+through caddy resolves to `actor: dev`, `source: tailscale-whois`,
+`verified: true`, and one carrying forged headers still does. The same
+forged headers sent straight to `arch:8438` from `dev` resolve to `dev` as
+well — by a different route, which `X-Br-Actor-Source` records.
+
+`trusted_proxies` takes IPs or CIDRs. An empty list trusts nobody: traffic
+through an unlisted proxy is still served, attributed to the proxy *machine*
+(that is the peer the transport sees), which is honest and also the sign
+that the list is missing an entry.
 
 **On this tailnet, user identity is not available.** 13 of 15 nodes are
 `tagged-devices`, which have no owning user for tailscale to report. So the
@@ -272,10 +301,11 @@ knows nothing.
 
 ## Security
 
-The daemon binds a unix socket at mode `0600`. The bridge
-(`systemd-socket-proxyd`, same user) connects to it while other local users
-are shut out; the bridge's own TCP port binds only the tailscale IP, so the
-LAN never sees it.
+The daemon binds two listeners. The unix socket, mode `0600`, is the local
+path: other local users are shut out. The TCP address is this box's
+tailscale IP, so the LAN never sees it; it is bound with `IP_FREEBIND` so the
+daemon comes up at login even before tailscaled has brought the address up,
+instead of failing its start budget waiting for it.
 
 Two `br` flags are refused anywhere in `args`, because each breaks a promise
 the URL makes:
@@ -297,9 +327,10 @@ started from a shell that exports it would serve every repo from one workspace
 while still reporting the requested repo's name. Nothing in the response would
 signal the mistake. There is a regression test for exactly this.
 
-> `--listen` makes the daemon bind TCP *instead of* the socket. Prefer the
-> socket plus the proxyd bridge: TCP is reachable by any local user, and the
-> daemon cannot serve both at once, so the pair of units beats the flag.
+> The socket is served whenever `socket` is set, which it is by default
+> unless only `listen` is given. So `--repo … --listen 127.0.0.1:7717` is a
+> TCP-only trial that will not collide with a running daemon's socket, and
+> a config that names both serves both.
 
 ## Events
 
@@ -322,23 +353,30 @@ curl -fsSL "https://bw.dev.a44.io/setup.sh?$(date +%s)" | bash
 ```
 
 That installs a prebuilt binary matching the served commit, discovers the
-`.beads` workspaces on the box, writes the config, generates the systemd units
-with this box's own tailnet address, starts it, and health-checks all of it.
-`--yes` takes every default for an unattended run; `--dry-run` prints the plan
-and changes nothing; `--uninstall` reverses it and keeps every `.beads`. See
+`.beads` workspaces on the box, writes the config with this box's own tailnet
+address as `listen` and the proxy box (`pi`, resolved with `tailscale ip`;
+`--proxy-host` or `--trusted-proxy` to say otherwise) as `trusted_proxies`,
+generates the systemd unit, starts it, and health-checks all of it. `--yes`
+takes every default for an unattended run; `--dry-run` prints the plan and
+changes nothing; `--uninstall` reverses it and keeps every `.beads`. See
 [Releases](#releases) for what is being served and how it gets there.
 
-Re-running it is safe. An existing `config.json` is never touched, not by a
-plain re-run and not by `--force`, which only means "reinstall the binary
-even when the installed commit is current". To refresh the `repos` list from
-discovery (or from `--repo` flags) pass `--rewrite-config`: it keeps every
-other key (`notify`, `allow`, `br_path`, …), keeps the name you gave a repo
-that is still there, names each entry it drops, and leaves a timestamped
-`config.json.bak.<ts>` beside the file first. `--dry-run` says which of these
-a run would do.
+Re-running it is safe. An existing `config.json` is never rewritten, not by
+a plain re-run and not by `--force`, which only means "reinstall the binary
+even when the installed commit is current". Two things a re-run does do to
+it, each named on the way and each preceded by a timestamped
+`config.json.bak.<ts>`: it adds a key the current release needs when the
+file lacks it (`listen`, `trusted_proxies`), and, only with
+`--rewrite-config`, it refreshes the `repos` list from discovery (or from
+`--repo` flags), keeping every other key, keeping the name you gave a repo
+that is still there, and naming each entry it drops. `--dry-run` says which
+of these a run would do. An upgrade from a version that had the
+`systemd-socket-proxyd` bridge retires the pair once the config has a
+`listen` address, and keeps it, with a warning, until then.
 
-Needs `br` on `PATH`, plus tailscale for the bridge. It falls back to building
-from source when no prebuilt matches the box, which needs Go 1.24+.
+Needs `br` on `PATH`, plus tailscale for the tailnet address. It falls back
+to building from source when no prebuilt matches the box, which needs Go
+1.24+.
 
 From a clone instead, which skips the fileserver entirely:
 
@@ -360,6 +398,8 @@ Write a config at `~/.config/beads_watch/config.json`:
 ```json
 {
   "socket": "/run/user/1000/beads_watch.sock",
+  "listen": "100.110.83.42:8438",
+  "trusted_proxies": ["100.79.209.73"],
   "repos": [
     { "name": "cell", "path": "/home/goku/cell" },
     { "name": "beads_watch", "path": "/home/goku/dev/beads_watch" }
@@ -367,33 +407,28 @@ Write a config at `~/.config/beads_watch/config.json`:
 }
 ```
 
-Check it before wiring systemd. `--print-config` applies every default and
-validates every repo path without binding anything:
+`listen` is this box's own `tailscale ip -4`; `trusted_proxies` is the box
+running caddy. Check it before wiring systemd. `--print-config` applies every
+default and validates every repo path without binding anything:
 
 ```bash
 beads_watch --print-config
 ```
 
-Run it under systemd. The units in `systemd/` are made to be symlinked, and
-carry arch's tailnet address, so a different box needs a drop-in to override
-`ListenStream`. `setup.sh` exists partly to avoid that: it generates the units
-with the local address already in them. If you wire it up by hand and later run
-`setup.sh`, it replaces the symlinks with real files and moves any drop-in
-aside, keeping a timestamped backup.
+Run it under systemd. The unit in `systemd/` is made to be symlinked; the
+address lives in the config, so the unit is the same on every box. If you
+wire it up by hand and later run `setup.sh`, it replaces the symlink with a
+real file and moves any drop-in aside, keeping a timestamped backup.
 
 ```bash
-ln -s ~/dev/beads_watch/systemd/beads_watch.service \
-      ~/dev/beads_watch/systemd/beads_watch-proxy.socket \
-      ~/dev/beads_watch/systemd/beads_watch-proxy.service \
-      ~/.config/systemd/user/
+ln -s ~/dev/beads_watch/systemd/beads_watch.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now beads_watch beads_watch-proxy.socket
+systemctl --user enable --now beads_watch
 loginctl enable-linger "$USER"   # so it survives logout
 ```
 
-Edit `ListenStream` in `beads_watch-proxy.socket` to this box's own
-`tailscale ip -4` first. Then name it from pi, which takes one line because the
-wildcard cert already covers it:
+Then name it from pi, which takes one line because the wildcard cert already
+covers it:
 
 ```bash
 ssh pi caddy/expose beads-<node> <tailscale-ip>:8438
@@ -401,8 +436,8 @@ ssh pi caddy/expose beads-<node> <tailscale-ip>:8438
 
 and copy the `header_up -Tailscale-User-Login` /
 `header_up -Tailscale-User-Name` strips from an existing `beads-*.caddy`
-into the generated site file (see [Identity](#identity); without them the
-verified actor is forgeable).
+into the generated site file (see [Identity](#identity); without them a
+caller could forge a verified actor *through* caddy).
 
 Verify all three hops:
 
@@ -411,6 +446,10 @@ curl -s --unix-socket /run/user/1000/beads_watch.sock http://local/v1/health
 curl -s "$(tailscale ip -4 | head -1):8438/v1/health"
 curl -s https://beads-<node>.dev.a44.io/v1/health
 ```
+
+The second one is a direct TCP peer, so `/v1/whoami` on it should say
+`source: tailscale-whois-direct` and name this box, whatever headers you
+send; the third should say `tailscale-whois` and `trusted_proxy: true`.
 
 ## Releases
 
@@ -464,7 +503,7 @@ the release traceable:
 
 ```console
 $ beads_watch --version
-beads_watch 1.0.3
+beads_watch 1.1.0
 commit: 923ce5017418018c3ff1f0113d91dfefca1ce58e
 built:  2026-09-09T13:17:48Z
 ```
@@ -481,7 +520,7 @@ The daemon takes no subcommands. Flags override the config file.
 |---|---|
 | `--config <path>` | Config file. Default `$XDG_CONFIG_HOME/beads_watch/config.json`. |
 | `--socket <path>` | Unix socket to bind, overriding the config. |
-| `--listen <addr>` | Bind TCP *instead of* the socket, e.g. `127.0.0.1:7717`. |
+| `--listen <addr>` | TCP address to serve as well, e.g. `127.0.0.1:7717`; overrides `listen`. With no socket configured it is TCP only. |
 | `--repo name=path` | Serve a repo ad hoc. Repeatable, and **replaces** the config file entirely. |
 | `--timeout <sec>` | Per-request `br` timeout. Default 30. |
 | `--print-config` | Print the effective config, with defaults applied, and exit. |
@@ -498,6 +537,8 @@ instead of silently doing nothing.
 ```json
 {
   "socket": "/run/user/1000/beads_watch.sock",
+  "listen": "100.110.83.42:8438",
+  "trusted_proxies": ["100.79.209.73"],
   "repos": [
     { "name": "cell", "path": "/home/goku/cell" }
   ],
@@ -519,7 +560,9 @@ instead of silently doing nothing.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `socket` | `$XDG_RUNTIME_DIR/beads_watch.sock` | Unix socket to bind. |
+| `socket` | `$XDG_RUNTIME_DIR/beads_watch.sock`, unless `listen` is set | Unix socket to bind, mode 0600. Set `listen` without `socket` for TCP only. |
+| `listen` | absent (none) | TCP address to bind as well: this box's tailscale IP and port, bound with `IP_FREEBIND` so it works before tailscaled brings the address up at login. |
+| `trusted_proxies` | `[]` (nobody) | IPs or CIDRs whose forwarded identity headers are believed. Every other TCP peer is identified by its own address. See [Identity](#identity). |
 | `repos[].name` | basename of `path` | URL path segment. An alias, so a repo can be renamed on the wire without moving on disk. |
 | `repos[].path` | required | Directory `br` runs in. `br` walks up from here to find `.beads`. A path that is missing on this box is served as unavailable (one startup warning, `ok: false` in `/v1/repos`, 503 on `br`), not treated as a config error; only *every* path missing is fatal. |
 | `allow` | the read commands plus create/claim/close | **Replaces** the default allowlist; it does not extend it. |
@@ -530,12 +573,20 @@ instead of silently doing nothing.
 | `inject_json` | `true` | Add `--json` when the caller picked no format. |
 | `notify` | absent (off) | Event publishing. Keys documented in [EVENTS.md](EVENTS.md). |
 
+Because unknown keys are fatal, a binary older than 1.1.0 refuses a config
+that carries `listen` or `trusted_proxies`. `setup.sh` installs the binary
+before it adds either key, so an upgrade through it never hits this; a
+hand-managed box should upgrade the binary first.
+
 ## Troubleshooting
 
 ### HTTP 502 with an empty body
 
-The bridge is up and the daemon is not. A daemon that cannot start (a
-config it refuses) is retried five times in a minute and then left `failed`,
+Caddy is up and the daemon behind it is not answering on `listen`. Either
+the daemon is down, or it is up but serving the socket only — check that the
+config has a `listen` address and the journal shows it on the `serving`
+line. A daemon that cannot start (a config it refuses) is retried five times
+in a minute and then left `failed`,
 which is the state that shows up in `--failed`; a unit still inside those
 retries reports `activating (auto-restart)` for a few seconds first:
 
@@ -594,10 +645,14 @@ Ask the daemon what it saw:
 curl -s https://beads-<node>.dev.a44.io/v1/whoami | jq .
 ```
 
-`source: none` through caddy usually means the site file is missing the
-`header_up -Tailscale-User-Login` strip, or `X-Forwarded-For` is not reaching
-the daemon. On a tagged device an actor of the *machine* name is correct rather
-than a bug; see [Identity](#identity).
+Look at `transport` first. Every write through caddy landing as the *proxy
+box* (`actor: pi`, `source: tailscale-whois-direct`, `trusted_proxy: false`)
+means caddy's address is not in `trusted_proxies`, so the daemon is
+identifying caddy itself instead of reading its headers. `source: none` with
+`trusted_proxy: true` means the headers are not arriving: the site file is
+missing the `header_up -Tailscale-User-Login` strip, or `X-Forwarded-For` is
+not reaching the daemon. On a tagged device an actor of the *machine* name
+is correct rather than a bug; see [Identity](#identity).
 
 ### HTTP 403 `COMMAND_NOT_ALLOWED`
 
@@ -624,14 +679,9 @@ to check.
 
 ## Limitations
 
-- **Forwarded identity is trusted from any peer.** A caller that reaches the
-  bridge port directly, skipping caddy, can set `Tailscale-User-Login` or
-  `X-Forwarded-For` and mint a verified actor. `systemd-socket-proxyd` erases
-  the TCP peer before the unix socket, so the daemon cannot tell caddy from a
-  direct caller. Exposure is tailnet-only; the fix is a trusted-proxy list,
-  which needs the daemon to see the real peer. Tracked in beads.
-- **`--listen` is exclusive, not additive.** The daemon serves a socket or a
-  TCP address, never both, which is why the proxyd bridge exists.
+- **Identity is only as good as `trusted_proxies`.** A proxy left off the
+  list is served but identified as itself, so every write through it lands
+  as the proxy machine. Loud, but wrong until the list is fixed.
 - **No auth, no TLS, no rate limiting of its own.** Every bit of that is the
   transport's job. Exposed outside a tailnet, this daemon is an unauthenticated
   remote shell onto the allowlisted `br` surface.
@@ -682,11 +732,13 @@ Yes, and they will disagree unless the underlying `.beads` is shared or synced,
 because each node runs `br` against its own working copy. The daemon has no
 notion of a cluster; the caddy sites directory is the only registry.
 
-### Why a unix socket instead of TCP?
+### Why a unix socket *and* TCP?
 
-Mode `0600` shuts out every other local user on a box running agent swarms.
-Localhost TCP does not. The proxyd bridge exists to add tailnet reachability
-without giving that up.
+The socket, mode `0600`, is for local callers: it shuts out every other
+local user on a box running agent swarms, which localhost TCP would not. The
+TCP listener is for the tailnet, and it is the daemon's own rather than a
+bridge's because only the process that accepts the connection knows who the
+peer is — and that is what tells caddy apart from anyone else.
 
 ### Why is my actor the machine name and not a person?
 

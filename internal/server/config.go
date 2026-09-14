@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -50,8 +52,20 @@ func (r Repo) Err() error { return r.err }
 
 // Config is the daemon's whole configuration.
 type Config struct {
+	// Socket is the unix socket for local callers, mode 0600. It defaults to
+	// $XDG_RUNTIME_DIR/beads_watch.sock when Listen is not set either, so a
+	// config with neither still serves; set Listen alone for TCP only.
 	Socket string `json:"socket"`
-	Repos  []Repo `json:"repos"`
+	// Listen is a TCP address served alongside the socket: this box's
+	// tailscale IP and the bridge port, so the reverse proxy reaches the
+	// daemon directly and the daemon sees the real peer. Empty means none.
+	Listen string `json:"listen,omitempty"`
+	// TrustedProxies are the addresses, IPs or CIDRs, whose forwarded identity
+	// headers are believed. Any other TCP peer is identified by its own
+	// address, whatever its headers say; on the unix socket forwarded headers
+	// are never believed, since nothing there can vouch for them.
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
+	Repos          []Repo   `json:"repos"`
 
 	// Allow is the set of permitted br subcommands, matched against the first
 	// token of args. Empty means DefaultAllow.
@@ -70,6 +84,9 @@ type Config struct {
 	// publishes typed events to ntfy. Absent means the feature is off and the
 	// daemon behaves exactly as it did before events existed.
 	Notify *events.Config `json:"notify,omitempty"`
+
+	// trusted is TrustedProxies parsed, filled by Normalize.
+	trusted []netip.Prefix
 }
 
 // DefaultAllow is the br surface reachable over the network out of the box:
@@ -104,7 +121,7 @@ var DeniedFlags = []string{"--db", "--actor"}
 
 var validRepoName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
-// DefaultSocket is the unix socket tailscale serve proxies to.
+// DefaultSocket is where local callers find the daemon.
 func DefaultSocket() string {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "beads_watch.sock")
@@ -124,7 +141,9 @@ func DefaultConfigPath() string {
 	return filepath.Join(home, ".config", "beads_watch", "config.json")
 }
 
-// LoadConfig reads and validates a config file.
+// LoadConfig reads a config file. It does not Normalize: flags may still
+// override fields, and the socket default depends on whether a TCP address
+// ends up set, so the caller normalizes once after every override is in.
 func LoadConfig(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -134,9 +153,6 @@ func LoadConfig(path string) (*Config, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	if err := cfg.Normalize(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &cfg, nil
@@ -155,8 +171,23 @@ func LoadConfig(path string) (*Config, error) {
 // survives the probe: a daemon that comes up and serves nothing is worse than
 // one that refuses to start, so that case stays fatal.
 func (c *Config) Normalize() error {
-	if c.Socket == "" {
+	c.Socket = strings.TrimSpace(c.Socket)
+	c.Listen = strings.TrimSpace(c.Listen)
+	if c.Socket == "" && c.Listen == "" {
 		c.Socket = DefaultSocket()
+	}
+	if c.Listen != "" {
+		if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+			return fmt.Errorf("listen %q: %w", c.Listen, err)
+		}
+	}
+	c.trusted = c.trusted[:0]
+	for i, raw := range c.TrustedProxies {
+		p, err := parsePrefix(raw)
+		if err != nil {
+			return fmt.Errorf("trusted_proxies[%d] %q: not an IP address or CIDR", i, raw)
+		}
+		c.trusted = append(c.trusted, p)
 	}
 	if c.TimeoutSeconds <= 0 {
 		c.TimeoutSeconds = 30
@@ -247,6 +278,33 @@ func (c *Config) NotifyRepos() []events.Repo {
 		}
 	}
 	return out
+}
+
+// parsePrefix accepts an IP or a CIDR, so a config can name one proxy box or
+// a whole subnet without two syntaxes to remember.
+func parsePrefix(raw string) (netip.Prefix, error) {
+	raw = strings.TrimSpace(raw)
+	if p, err := netip.ParsePrefix(raw); err == nil {
+		return p.Masked(), nil
+	}
+	a, err := netip.ParseAddr(raw)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	a = a.Unmap()
+	return netip.PrefixFrom(a, a.BitLen()), nil
+}
+
+// TrustedProxy reports whether forwarded identity headers from this peer are
+// believed. Only Normalize's parsed list counts, never the raw strings.
+func (c *Config) TrustedProxy(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, p := range c.trusted {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // Unavailable is every repo whose path failed the startup probe.

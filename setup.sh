@@ -36,7 +36,12 @@
 #   --no-units        do not install the systemd user units
 #   --no-start        install the units but do not start them
 #   --no-verify       skip sha256 verification of downloaded artifacts
-#   --port PORT       tailnet bridge port (default: 8438)
+#   --port PORT       tailnet port the daemon listens on (default: 8438)
+#   --proxy-host NAME the box running the reverse proxy; its forwarded identity
+#                     headers are trusted. A MagicDNS name or an ssh alias
+#                     for one (default: pi; also BW_PROXY_HOST)
+#   --trusted-proxy A trust forwarded identity from this IP or CIDR instead;
+#                     repeatable, and skips resolving --proxy-host
 #   --dry-run         print the plan; change nothing
 #   --uninstall       remove binary and units (keeps config and every .beads)
 #   --quiet, -q       errors only
@@ -68,8 +73,13 @@ UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SRC_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/beads_watch/src"
 LOCK_DIR="${TMPDIR:-/tmp}/beads_watch-setup.lock.d"
 BRIDGE_PORT=8438
+PROXY_HOST="${BW_PROXY_HOST:-pi}"
+TRUSTED_PROXIES=()
 BIN_NAME=beads_watch
 SERVICE_UNIT=beads_watch.service
+# The socket-activated bridge that used to sit between caddy and the socket.
+# The daemon binds the tailnet address itself now; these names remain so an
+# upgrade can retire the pair.
 PROXY_SOCKET=beads_watch-proxy.socket
 PROXY_SERVICE=beads_watch-proxy.service
 
@@ -226,6 +236,8 @@ while [[ $# -gt 0 ]]; do
     --dist-url) need_value --dist-url "${2:-}"; DIST_URL="${2%/}"; shift 2 ;;
     --repo) need_value --repo "${2:-}"; CLI_REPOS+=("$2"); shift 2 ;;
     --port) need_value --port "${2:-}"; BRIDGE_PORT="$2"; shift 2 ;;
+    --proxy-host) need_value --proxy-host "${2:-}"; PROXY_HOST="$2"; shift 2 ;;
+    --trusted-proxy) need_value --trusted-proxy "${2:-}"; TRUSTED_PROXIES+=("$2"); shift 2 ;;
     --from-source) FROM_SOURCE=1; shift ;;
     --force) FORCE=1; shift ;;
     --yes | -y) ASSUME_YES=1; shift ;;
@@ -568,6 +580,176 @@ discover_repos() { # prints name<TAB>path for every .beads workspace under $HOME
   done
 }
 
+# The tailnet address the daemon listens on, or nothing when this box has no
+# tailscale IP.
+listen_addr() {
+  local ip
+  ip=$(tailnet_ip)
+  [[ -n "$ip" ]] && printf '%s:%s' "$ip" "$BRIDGE_PORT"
+  return 0
+}
+
+# The tailnet IPv4 of a box named the way people name it: a MagicDNS name, or
+# an ssh alias for one (`ssh pi` is how the README addresses the caddy box,
+# and its Host entry knows the real name). Empty when neither resolves.
+proxy_host_ip() {
+  local name="$1" ip="" via
+  ip=$(tailscale ip -4 "$name" 2>/dev/null | head -1) || true
+  if [[ -z "$ip" ]] && command -v ssh &>/dev/null; then
+    via=$(ssh -G "$name" 2>/dev/null | awk '/^hostname /{print $2; exit}')
+    if [[ -n "$via" && "$via" != "$name" ]]; then
+      ip=$(tailscale ip -4 "$via" 2>/dev/null | head -1) || true
+    fi
+  fi
+  printf '%s' "$ip"
+}
+
+# The proxies whose forwarded identity the daemon believes, as a JSON array in
+# TRUSTED_JSON. --trusted-proxy wins outright; otherwise the reverse-proxy box
+# is resolved by name, and TRUSTED_RESOLVED records which name became which
+# address. An empty list is honest rather than a guess: traffic through an
+# unlisted proxy is still served, attributed to the proxy machine itself
+# (that is the peer the transport sees), and the warning says so. Resolved
+# once; sets globals rather than printing so it can run outside a subshell.
+TRUSTED_JSON=""
+TRUSTED_RESOLVED=""
+resolve_trusted_proxies() {
+  [[ -n "$TRUSTED_JSON" ]] && return 0
+  local list=("${TRUSTED_PROXIES[@]}")
+  if [[ ${#list[@]} -eq 0 && -n "$PROXY_HOST" ]] && command -v tailscale &>/dev/null; then
+    local ip
+    ip=$(proxy_host_ip "$PROXY_HOST")
+    if [[ -n "$ip" ]]; then
+      list=("$ip")
+      TRUSTED_RESOLVED="$PROXY_HOST=$ip"
+    fi
+  fi
+  if [[ ${#list[@]} -eq 0 ]]; then
+    TRUSTED_JSON='[]'
+    return 0
+  fi
+  TRUSTED_JSON=$(printf '%s\n' "${list[@]}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+}
+
+# Merge into an existing config, or write a new one. Every top-level key the
+# operator set survives. "listen" and "trusted_proxies" are added when absent,
+# because this release's daemon binds the tailnet address itself and the
+# proxyd bridge is retired on the strength of that. With repos_mode=replace
+# the repos list is refreshed from stdin: a path already present keeps the
+# name the operator gave it, since the name is an alias and discovery only
+# knows basenames, and entries no longer found are dropped by name so the loss
+# is visible rather than silent. Writes DST; the caller decides whether that
+# differs from what is installed.
+CONFIG_MERGE_PY='
+import json, sys
+socket, listen, trusted, dst, existing, repos_mode = sys.argv[1:7]
+cfg = {}
+if existing:
+    try:
+        with open(existing) as f:
+            cfg = json.load(f)
+    except ValueError as e:
+        sys.exit("%s is not valid JSON (%s); fix or remove it, then re-run" % (existing, e))
+    if not isinstance(cfg, dict):
+        sys.exit("%s is not a JSON object; fix or remove it, then re-run" % existing)
+report = []
+if "socket" not in cfg and "listen" not in cfg:
+    cfg["socket"] = socket
+    report.append(("key", "socket", socket))
+if listen and not cfg.get("listen"):
+    cfg["listen"] = listen
+    report.append(("key", "listen", listen))
+if "trusted_proxies" not in cfg:
+    cfg["trusted_proxies"] = json.loads(trusted)
+    report.append(("key", "trusted_proxies", trusted))
+if repos_mode == "replace":
+    old = {}
+    for r in cfg.get("repos") or []:
+        if isinstance(r, dict) and r.get("path"):
+            old[r["path"]] = r.get("name") or ""
+    repos = []
+    for line in sys.stdin:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        name, _, path = line.partition("\t")
+        repos.append({"name": old.get(path) or name, "path": path})
+    new = {r["path"] for r in repos}
+    cfg["repos"] = repos
+    for path, name in old.items():
+        if path not in new:
+            report.append(("repo-", name, path))
+    for r in repos:
+        if r["path"] not in old:
+            report.append(("repo+", r["name"], r["path"]))
+with open(dst, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+for row in report:
+    print("\t".join(row))
+'
+
+# write_config MODE (new|migrate|replace): runs the merge, leaves the file
+# untouched when nothing would change, backs it up first when something
+# would, and narrates every change. Repos for replace come from REPO_PAIRS.
+# Returns 1 when it left the file alone.
+REPO_PAIRS=()
+write_config() {
+  local mode="$1" existing="" tmp report
+  [[ -f "$CONFIG_FILE" ]] && existing="$CONFIG_FILE"
+  mkdir -p "$CONFIG_DIR"
+  tmp=$(mktemp "$CONFIG_DIR/.config.json.XXXXXX") || die "cannot write in $CONFIG_DIR" 1
+
+  local socket="${XDG_RUNTIME_DIR:-/tmp}/beads_watch.sock"
+  local listen repos_mode=keep
+  listen=$(listen_addr)
+  resolve_trusted_proxies
+  [[ "$mode" == replace || "$mode" == new ]] && repos_mode=replace
+  report=$(printf '%s\n' "${REPO_PAIRS[@]}" | python3 -c "$CONFIG_MERGE_PY" \
+    "$socket" "$listen" "$TRUSTED_JSON" "$tmp" "$existing" "$repos_mode") \
+    || { rm -f "$tmp"; die 'could not write the config' 1; }
+
+  # Nothing to change means nothing to write: the operator's own formatting
+  # is left exactly as it was, not re-serialized.
+  if [[ -n "$existing" && -z "$report" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  local backup=""
+  if [[ -n "$existing" ]]; then
+    backup="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$existing" "$backup" || { rm -f "$tmp"; die "could not back up $CONFIG_FILE" 1; }
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$CONFIG_FILE" || die "could not write $CONFIG_FILE" 1
+
+  case "$mode" in
+    new) ok "wrote $CONFIG_FILE" ;;
+    migrate) ok "updated $CONFIG_FILE for this release (backup: $backup)" ;;
+    replace) ok "rewrote repos in $CONFIG_FILE (backup: $backup)" ;;
+  esac
+  local kind name value
+  while IFS=$'\t' read -r kind name value; do
+    [[ -n "$kind" ]] || continue
+    case "$kind" in
+      key)
+        if [[ "$name" == trusted_proxies ]]; then
+          if [[ "$value" == '[]' ]]; then
+            warn "added trusted_proxies = [] — no proxy resolved ($PROXY_HOST); traffic through caddy will be attributed to the proxy box. Re-run with --trusted-proxy IP"
+          else
+            info "added $name = $value${TRUSTED_RESOLVED:+ ($TRUSTED_RESOLVED)}"
+          fi
+        else
+          info "added $name = $value"
+        fi ;;
+      repo-) warn "dropped $name → $value (not found by discovery; still in the backup)" ;;
+      repo+) info "added $name → $value" ;;
+    esac
+  done <<<"$report"
+  return 0
+}
+
 # What this run will do to the config, in one line, shared by the plan and the
 # phase so --dry-run cannot describe one thing and the run do another.
 config_plan() {
@@ -577,9 +759,42 @@ config_plan() {
     echo "$CONFIG_FILE (new; repos from $([[ ${#CLI_REPOS[@]} -gt 0 ]] && echo '--repo' || echo 'discovery'))"
   elif [[ "$REWRITE_CONFIG" -eq 1 ]]; then
     echo "$CONFIG_FILE (rewrite: repos from $([[ ${#CLI_REPOS[@]} -gt 0 ]] && echo '--repo' || echo 'discovery'), other keys kept, backup first)"
+  elif config_needs_migration; then
+    echo "$CONFIG_FILE (exists; adds listen/trusted_proxies for this release, backup first)"
   else
     echo "$CONFIG_FILE (exists; left alone)"
   fi
+}
+
+# Whether the existing config lacks a key this release adds. Read-only.
+config_needs_migration() {
+  [[ -f "$CONFIG_FILE" ]] || return 1
+  local listen
+  listen=$(listen_addr)
+  python3 -c '
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+listen = sys.argv[2]
+need = (listen and not cfg.get("listen")) or "trusted_proxies" not in cfg
+sys.exit(0 if need else 1)
+' "$CONFIG_FILE" "$listen" 2>/dev/null
+}
+
+# Whether the config the daemon will run with has a listen address, i.e. the
+# proxyd bridge can be retired. Asks the installed binary so the answer is the
+# daemon's, defaults and all.
+config_has_listen() {
+  [[ -x "$PREFIX/$BIN_NAME" ]] || return 1
+  "$PREFIX/$BIN_NAME" --print-config 2>/dev/null | python3 -c '
+import json, sys
+try:
+    sys.exit(0 if json.load(sys.stdin).get("listen") else 1)
+except Exception:
+    sys.exit(1)
+'
 }
 
 setup_config() {
@@ -590,116 +805,62 @@ setup_config() {
   # Discovery only knows how to produce a repos list, so regenerating from it
   # would drop notify, allow, br_path and the rest — and the daemon would come
   # up green with the event feed silently gone. Only the explicit flag
-  # rewrites, and even then it merges rather than replaces.
+  # rewrites repos, and even then it merges rather than replaces. What does
+  # happen without it is a migration: keys this release needs are added when
+  # absent, each one named, with a backup — nothing else is touched.
   if [[ -f "$CONFIG_FILE" && "$REWRITE_CONFIG" -eq 0 ]]; then
-    ok "config exists: $CONFIG_FILE (left alone; --rewrite-config to refresh repos)"
     [[ ${#CLI_REPOS[@]} -gt 0 ]] && warn "--repo ignored: the config already exists (add --rewrite-config to apply it)"
+    if write_config migrate; then
+      :
+    else
+      ok "config exists: $CONFIG_FILE (left alone; --rewrite-config to refresh repos)"
+    fi
+    validate_config
     return 0
   fi
 
-  local pairs=()
+  REPO_PAIRS=()
   if [[ ${#CLI_REPOS[@]} -gt 0 ]]; then
     local spec
     for spec in "${CLI_REPOS[@]}"; do
       [[ "$spec" == *=* ]] || die "--repo wants NAME=PATH, got '$spec'" 2
-      pairs+=("${spec%%=*}	${spec#*=}")
+      REPO_PAIRS+=("${spec%%=*}	${spec#*=}")
     done
   else
     info "scanning $HOME/dev and $HOME for .beads workspaces (maxdepth 2)"
     local line
     while IFS= read -r line; do
-      [[ -n "$line" ]] && pairs+=("$line")
+      [[ -n "$line" ]] && REPO_PAIRS+=("$line")
     done < <(discover_repos)
   fi
 
-  if [[ ${#pairs[@]} -eq 0 ]]; then
+  if [[ ${#REPO_PAIRS[@]} -eq 0 ]]; then
     warn "no .beads workspaces found; writing no config"
     warn "create $CONFIG_FILE by hand, or re-run with --repo name=/path"
     return 0
   fi
 
-  info "found ${#pairs[@]} repo(s):"
+  info "found ${#REPO_PAIRS[@]} repo(s):"
   local p
-  for p in "${pairs[@]}"; do
+  for p in "${REPO_PAIRS[@]}"; do
     [[ "$QUIET" -eq 1 ]] || echo "    ${p%%	*}  →  ${p#*	}"
   done
-  local existing=""
   if [[ -f "$CONFIG_FILE" ]]; then
-    existing="$CONFIG_FILE"
     ask_yn "Rewrite the repos in $CONFIG_FILE to these (other keys kept, backup first)?" y \
-      || { info "config left alone"; return 0; }
+      || { info "config left alone"; validate_config; return 0; }
+    write_config replace || ok "config already matches: $CONFIG_FILE (left alone)"
   else
     ask_yn "Write $CONFIG_FILE serving these?" y || { info "config skipped"; return 0; }
+    write_config new
   fi
+  validate_config
+}
 
-  mkdir -p "$CONFIG_DIR"
-  local backup=""
-  if [[ -n "$existing" ]]; then
-    backup="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$CONFIG_FILE" "$backup" || die "could not back up $CONFIG_FILE" 1
-  fi
-
-  # Merge, not replace: every top-level key the operator set survives, only
-  # repos is refreshed. A path already in the config keeps the name the
-  # operator gave it, since the name is an alias and discovery only knows
-  # basenames. Entries that discovery no longer finds are dropped and named,
-  # so the loss is visible rather than silent — the backup has them.
-  local socket="${XDG_RUNTIME_DIR:-/tmp}/beads_watch.sock"
-  local report
-  report=$(printf '%s\n' "${pairs[@]}" | python3 -c '
-import json, sys
-socket, dst, existing = sys.argv[1], sys.argv[2], sys.argv[3]
-cfg = {}
-if existing:
-    try:
-        with open(existing) as f:
-            cfg = json.load(f)
-    except ValueError as e:
-        sys.exit("%s is not valid JSON (%s); fix or remove it, then re-run" % (existing, e))
-    if not isinstance(cfg, dict):
-        sys.exit("%s is not a JSON object; fix or remove it, then re-run" % existing)
-old = {}
-for r in cfg.get("repos") or []:
-    if isinstance(r, dict) and r.get("path"):
-        old[r["path"]] = r.get("name") or ""
-repos = []
-for line in sys.stdin:
-    line = line.rstrip("\n")
-    if not line:
-        continue
-    name, _, path = line.partition("\t")
-    repos.append({"name": old.get(path) or name, "path": path})
-new = {r["path"] for r in repos}
-cfg.setdefault("socket", socket)
-cfg["repos"] = repos
-with open(dst, "w") as f:
-    json.dump(cfg, f, indent=2)
-    f.write("\n")
-for path, name in old.items():
-    if path not in new:
-        print("dropped\t%s\t%s" % (name, path))
-for r in repos:
-    if r["path"] not in old:
-        print("added\t%s\t%s" % (r["name"], r["path"]))
-' "$socket" "$CONFIG_FILE" "$existing") || die 'could not write the config' 1
-
-  if [[ -n "$existing" ]]; then
-    ok "rewrote repos in $CONFIG_FILE (backup: $backup)"
-    local kind name path
-    while IFS=$'\t' read -r kind name path; do
-      [[ -n "$kind" ]] || continue
-      case "$kind" in
-        dropped) warn "dropped $name → $path (not found by discovery; still in the backup)" ;;
-        added) info "added $name → $path" ;;
-      esac
-    done <<<"$report"
-  else
-    ok "wrote $CONFIG_FILE"
-  fi
-
-  # Validate before anything tries to start against it. A config can pass and
-  # still carry a repo the daemon will serve as unavailable; it says so on
-  # stderr, and that is worth seeing here rather than in the journal later.
+# Validate before anything tries to start against it. A config can pass and
+# still carry a repo the daemon will serve as unavailable; it says so on
+# stderr, and that is worth seeing here rather than in the journal later.
+validate_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
   local verdict line
   if verdict=$("$PREFIX/$BIN_NAME" --print-config 2>&1 >/dev/null); then
     ok "config validates"
@@ -777,39 +938,13 @@ LockPersonality=true
 WantedBy=default.target
 UNIT
       ;;
-    "$PROXY_SOCKET")
-      cat <<UNIT
-[Unit]
-Description=beads_watch TCP bridge — tailnet :$BRIDGE_PORT → unix socket
-Documentation=https://github.com/a44-io/beads_watch
-
-[Socket]
-# Bind only the tailscale IP: tailnet peers (i.e. caddy on pi) can reach it,
-# the LAN cannot. FreeBind lets the socket exist before tailscaled brings the
-# address up at login.
-ListenStream=$ip:$BRIDGE_PORT
-FreeBind=true
-
-[Install]
-WantedBy=sockets.target
-UNIT
-      ;;
-    "$PROXY_SERVICE")
-      cat <<UNIT
-[Unit]
-Description=beads_watch TCP bridge — proxy to the unix socket
-Documentation=https://github.com/a44-io/beads_watch
-Requires=$SERVICE_UNIT
-After=$SERVICE_UNIT
-
-[Service]
-ExecStart=/usr/lib/systemd/systemd-socket-proxyd %t/beads_watch.sock
-PrivateTmp=true
-NoNewPrivileges=true
-UNIT
-      ;;
     *) die "render_unit: unknown unit $unit" 1 ;;
   esac
+}
+
+# Whether the retired proxyd bridge is still installed here.
+proxy_bridge_present() {
+  [[ -e "$UNIT_DIR/$PROXY_SOCKET" || -e "$UNIT_DIR/$PROXY_SERVICE" ]]
 }
 
 # Fingerprint the installed units, so a re-run that changes nothing does not
@@ -833,15 +968,22 @@ units_plan() {
 
   local ip u pending=()
   ip=$(tailnet_ip)
-  local units=("$SERVICE_UNIT")
-  [[ -n "$ip" ]] && units+=("$PROXY_SOCKET" "$PROXY_SERVICE")
-  for u in "${units[@]}"; do
-    if [[ ! -e "$UNIT_DIR/$u" ]]; then
-      pending+=("$u (new)")
-    elif ! diff -q <(render_unit "$u" "$ip") "$UNIT_DIR/$u" >/dev/null 2>&1; then
-      pending+=("$u (changed)")
+  if [[ ! -e "$UNIT_DIR/$SERVICE_UNIT" ]]; then
+    pending+=("$SERVICE_UNIT (new)")
+  elif ! diff -q <(render_unit "$SERVICE_UNIT" "$ip") "$UNIT_DIR/$SERVICE_UNIT" >/dev/null 2>&1; then
+    pending+=("$SERVICE_UNIT (changed)")
+  fi
+  if proxy_bridge_present; then
+    # The bridge goes once the daemon has a listen address of its own; the
+    # config phase adds one whenever this box has a tailnet IP.
+    if [[ "$NO_START" -eq 1 ]]; then
+      pending+=("proxyd bridge kept: --no-start")
+    elif config_has_listen || { [[ "$NO_CONFIG" -eq 0 && -n "$ip" ]]; }; then
+      pending+=("$PROXY_SOCKET + $PROXY_SERVICE (retire)")
+    else
+      pending+=("proxyd bridge kept: config has no listen")
     fi
-  done
+  fi
   if [[ ${#pending[@]} -eq 0 ]]; then
     echo "$UNIT_DIR (all current)"
     return 0
@@ -869,7 +1011,7 @@ setup_units() {
   local ip
   ip=$(tailnet_ip)
   if [[ -z "$ip" ]]; then
-    warn "no tailscale IPv4 on this box; installing the daemon unit but not the bridge"
+    warn "no tailscale IPv4 on this box; the daemon will serve the unix socket only"
   else
     ok "tailnet address: $ip"
   fi
@@ -882,36 +1024,21 @@ setup_units() {
   # A previous manual install symlinks these into a checkout. Redirecting onto
   # a symlink writes THROUGH it and edits the repo's tracked unit files, so
   # clear the link first and write a real file in its place.
-  local unit
-  for unit in "$SERVICE_UNIT" "$PROXY_SOCKET" "$PROXY_SERVICE"; do
-    if [[ -L "$UNIT_DIR/$unit" ]]; then
-      info "replacing symlinked $unit (was → $(readlink "$UNIT_DIR/$unit"))"
-      rm -f "$UNIT_DIR/$unit"
-    fi
-  done
+  if [[ -L "$UNIT_DIR/$SERVICE_UNIT" ]]; then
+    info "replacing symlinked $SERVICE_UNIT (was → $(readlink "$UNIT_DIR/$SERVICE_UNIT"))"
+    rm -f "$UNIT_DIR/$SERVICE_UNIT"
+  fi
 
-  # Drop-ins outrank the unit file. The one this installer's predecessor needed
-  # exists to patch ListenStream onto a unit that hardcoded another box's IP,
-  # which is exactly what generating the unit per box makes unnecessary. Left
-  # in place it would silently override the address written below, so --port
-  # would not do what it says.
-  local dropin
-  for unit in "$SERVICE_UNIT" "$PROXY_SOCKET" "$PROXY_SERVICE"; do
-    dropin="$UNIT_DIR/$unit.d"
-    if [[ -d "$dropin" ]]; then
-      mv "$dropin" "$dropin.bak.$(date +%Y%m%d%H%M%S)"
-      warn "moved aside $unit.d (its overrides would outrank the generated unit)"
-    fi
-  done
+  # Drop-ins outrank the unit file. Left in place one would silently override
+  # what is written below.
+  local dropin="$UNIT_DIR/$SERVICE_UNIT.d"
+  if [[ -d "$dropin" ]]; then
+    mv "$dropin" "$dropin.bak.$(date +%Y%m%d%H%M%S)"
+    warn "moved aside $SERVICE_UNIT.d (its overrides would outrank the generated unit)"
+  fi
 
   render_unit "$SERVICE_UNIT" "$ip" >"$UNIT_DIR/$SERVICE_UNIT"
   ok "wrote $UNIT_DIR/$SERVICE_UNIT"
-
-  if [[ -n "$ip" ]]; then
-    render_unit "$PROXY_SOCKET" "$ip" >"$UNIT_DIR/$PROXY_SOCKET"
-    render_unit "$PROXY_SERVICE" "$ip" >"$UNIT_DIR/$PROXY_SERVICE"
-    ok "wrote the bridge units ($ip:$BRIDGE_PORT)"
-  fi
 
   after=$(units_fingerprint)
   [[ "$before" != "$after" ]] && UNITS_CHANGED=1
@@ -920,13 +1047,13 @@ setup_units() {
 
   if [[ "$NO_START" -eq 1 ]]; then
     info "units installed but not started (--no-start)"
+    proxy_bridge_present && warn "the proxyd bridge is still installed; it is retired when the daemon is next restarted by this script"
     return 0
   fi
   ask_yn "Enable and start beads_watch now?" y || { info "units left disabled"; return 0; }
 
   systemctl --user enable "$SERVICE_UNIT" &>/dev/null ||
     warn "could not enable $SERVICE_UNIT"
-  [[ -n "$ip" ]] && { systemctl --user enable "$PROXY_SOCKET" &>/dev/null || warn "could not enable $PROXY_SOCKET"; }
 
   # `enable --now` starts a stopped unit but leaves a running one alone, so on
   # an upgrade it would report success while the OLD binary kept serving. Any
@@ -938,13 +1065,22 @@ setup_units() {
     info "restarting to pick up the new $([[ "$BINARY_CHANGED" -eq 1 ]] && echo binary || echo units)"
   fi
 
-  # A .socket refuses to start while the service it activates is still running
-  # ("Socket service ... already active, refusing"), so restarting the socket
-  # on its own takes the bridge down and leaves it down. The pair has to come
-  # down together and go back up socket first, with the proxy service left for
-  # the socket to trigger on the next connection.
-  if [[ "$restarting" -eq 1 && -n "$ip" ]]; then
-    systemctl --user stop "$PROXY_SOCKET" "$PROXY_SERVICE" &>/dev/null || true
+  # The proxyd bridge used to own the tailnet port. Now that the daemon binds
+  # it itself the pair has to go first, or the restart fails on the bind — and
+  # it can only go when the daemon actually has a listen address, or caddy
+  # would be left with nothing to reach. Retiring it counts as a unit change:
+  # the daemon must restart onto the port.
+  if proxy_bridge_present; then
+    if config_has_listen; then
+      systemctl --user disable --now "$PROXY_SOCKET" "$PROXY_SERVICE" &>/dev/null || true
+      rm -f "$UNIT_DIR/$PROXY_SOCKET" "$UNIT_DIR/$PROXY_SERVICE"
+      systemctl --user daemon-reload
+      ok "retired the proxyd bridge; the daemon listens on the tailnet address itself"
+      systemctl --user is-active --quiet "$SERVICE_UNIT" && restarting=1
+    else
+      warn "config has no listen address; keeping the proxyd bridge in place"
+      warn "  add \"listen\": \"$ip:$BRIDGE_PORT\" to $CONFIG_FILE, or re-run without --no-config"
+    fi
   fi
 
   # A unit that hit its start limit stays "failed" and refuses a plain start
@@ -958,10 +1094,6 @@ setup_units() {
   else
     systemctl --user start "$SERVICE_UNIT" ||
       warn "could not start $SERVICE_UNIT; see: journalctl --user -u beads_watch -n 30"
-  fi
-
-  if [[ -n "$ip" ]]; then
-    systemctl --user start "$PROXY_SOCKET" || warn "could not start $PROXY_SOCKET"
   fi
 
   if command -v loginctl &>/dev/null; then
@@ -1009,15 +1141,27 @@ verify_install() {
   local ip
   ip=$(tailnet_ip)
   [[ -n "$ip" ]] || return 0
+  local who=""
   for i in 1 2 3; do
-    if curl -s --max-time 3 "http://$ip:$BRIDGE_PORT/v1/health" >/dev/null 2>&1; then
-      ok "bridge: http://$ip:$BRIDGE_PORT reachable"
+    if who=$(curl -s --max-time 3 "http://$ip:$BRIDGE_PORT/v1/whoami" 2>/dev/null) && [[ -n "$who" ]]; then
+      ok "tailnet: http://$ip:$BRIDGE_PORT reachable"
+      # This call is a direct TCP peer — this very box — so the daemon should
+      # have identified it by its address, not by any header. That line is
+      # the identity model working, seen from the outside.
+      local src
+      src=$(printf '%s' "$who" | sed -n 's/.*"source"[: ]*"\([^"]*\)".*/\1/p')
+      [[ -n "$src" ]] && info "identity over tcp: source=$src (a direct peer is named by its own address)"
       return 0
     fi
     sleep 1
   done
-  warn "bridge on $ip:$BRIDGE_PORT did not answer"
-  warn "  systemctl --user status $PROXY_SOCKET"
+  if proxy_bridge_present; then
+    warn "$ip:$BRIDGE_PORT did not answer; the proxyd bridge is still installed"
+    warn "  systemctl --user status $PROXY_SOCKET"
+  else
+    warn "$ip:$BRIDGE_PORT did not answer"
+    warn "  journalctl --user -u beads_watch -n 30   # look for a bind error; is \"listen\" set in $CONFIG_FILE?"
+  fi
 }
 
 # ── Uninstall ───────────────────────────────────────────────────────────────
@@ -1050,7 +1194,23 @@ print_plan() {
     "config   → $(config_plan)" \
     "units    → $(units_plan)" \
     "source   → $([[ "$REPO_MODE" -eq 1 && -z "$DIST_URL" ]] && echo "$HERE" || echo "${DIST_URL:-<none>}")" \
-    "bridge   → $(tailnet_ip):$BRIDGE_PORT"
+    "listen   → $(listen_addr_plan)" \
+    "trusts   → $(trusted_plan)"
+}
+
+listen_addr_plan() {
+  local l
+  l=$(listen_addr)
+  [[ -n "$l" ]] && echo "$l" || echo "none (no tailscale IPv4; unix socket only)"
+}
+
+trusted_plan() {
+  resolve_trusted_proxies
+  if [[ "$TRUSTED_JSON" == '[]' ]]; then
+    echo "no proxy (could not resolve $PROXY_HOST; pass --trusted-proxy IP)"
+  else
+    echo "$TRUSTED_JSON${TRUSTED_RESOLVED:+ ($TRUSTED_RESOLVED)}"
+  fi
 }
 
 print_summary() {
@@ -1061,10 +1221,10 @@ print_summary() {
   lines+=("binary   $PREFIX/$BIN_NAME")
   [[ -f "$CONFIG_FILE" ]] && lines+=("config   $CONFIG_FILE")
   [[ -n "$MANIFEST_COMMIT" ]] && lines+=("commit   ${MANIFEST_COMMIT:0:12}${MANIFEST_TAG:+ ($MANIFEST_TAG)}")
-  [[ -n "$ip" ]] && lines+=("bridge   http://$ip:$BRIDGE_PORT")
+  [[ -n "$ip" ]] && lines+=("tailnet  http://$ip:$BRIDGE_PORT")
   lines+=("")
-  lines+=("Name it from pi so it gets a URL:")
-  lines+=("  ssh pi caddy/expose beads-$(node_name) $ip:$BRIDGE_PORT")
+  lines+=("Name it from $PROXY_HOST so it gets a URL:")
+  lines+=("  ssh $PROXY_HOST caddy/expose beads-$(node_name) $ip:$BRIDGE_PORT")
   lines+=("")
   lines+=("Uninstall:  setup.sh --uninstall")
   echo ""

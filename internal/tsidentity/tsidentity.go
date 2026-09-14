@@ -1,17 +1,24 @@
-// Package tsidentity resolves a caller's tailnet identity from what the
-// `tailscale serve` proxy tells us about them.
+// Package tsidentity resolves a tailnet address to the machine and user
+// behind it, with `tailscale whois`, and reads the address a reverse proxy
+// forwarded.
 //
-// Two properties of the proxy make this trustworthy, both verified by
-// experiment against tailscale 1.98.9 rather than assumed:
+// Which address to resolve is the server's decision, made from the transport:
+// the proxy's forwarded X-Forwarded-For when the connection came from a
+// trusted proxy, the TCP peer itself otherwise. This package only knows how
+// to read the header and ask tailscale.
+//
+// Two properties of the proxies in use make the forwarded header worth
+// reading at all, both verified by experiment rather than assumed:
 //
 //   - A client-supplied Tailscale-User-Login header is STRIPPED, not passed
-//     through. So when that header arrives, the proxy put it there.
-//   - A client-supplied X-Forwarded-For is REPLACED, not appended. So the
-//     single address in it is the proxy's own view of the peer, and a caller
-//     cannot prepend a forged entry to shadow it.
+//     through (natively by `tailscale serve`; by an explicit header_up in the
+//     caddy site files). So when that header arrives, the proxy put it there.
+//   - X-Forwarded-For is either REPLACED (`tailscale serve`) or APPENDED to
+//     (caddy) with the proxy's own view of the peer. Either way the LAST entry
+//     is the proxy's, and a caller cannot prepend a forged entry to shadow it.
 //
-// If either were untrue, identity here would be self-asserted and worthless
-// for an audit trail.
+// If either were untrue, identity from a proxy would be self-asserted and
+// worthless for an audit trail.
 package tsidentity
 
 import (
@@ -74,17 +81,17 @@ type entry struct {
 	at   time.Time
 }
 
-// PeerAddr extracts the caller's tailnet address from the proxy's headers.
-// It returns "" when the request did not come through the proxy.
+// PeerAddr extracts the caller's tailnet address from the proxy's
+// X-Forwarded-For. It returns "" when there is none. The caller decides
+// whether the header is worth believing; see the package comment.
 func PeerAddr(xForwardedFor string) string {
 	xForwardedFor = strings.TrimSpace(xForwardedFor)
 	if xForwardedFor == "" {
 		return ""
 	}
-	// The proxy replaces rather than appends, so there is normally exactly one
-	// entry. Take the last defensively: if a future tailscale ever appends,
-	// the proxy's own entry is the trustworthy one, and a caller's forged
-	// prefix must not win.
+	// Caddy appends its observed peer, so the last entry is the proxy's own
+	// and a caller's forged prefix must not win. tailscale serve replaces the
+	// header outright, which the same rule covers.
 	parts := strings.Split(xForwardedFor, ",")
 	addr := strings.TrimSpace(parts[len(parts)-1])
 	if net.ParseIP(addr) == nil {

@@ -1,14 +1,18 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -204,23 +208,342 @@ func TestRequestActorIsUnverified(t *testing.T) {
 	}
 }
 
-// TestForgedUserHeaderIsTakenFromProxy documents the boundary: the daemon
-// trusts Tailscale-User-Login because the proxy strips a client-supplied one.
-// That guarantee is the proxy's, so the daemon must sit behind it.
-func TestForgedUserHeaderIsTakenFromProxy(t *testing.T) {
-	s, _ := testServer(t, `printf '%s' "$BD_ACTOR"`)
+// --- identity by transport ---------------------------------------------------
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/repos/demo/br", strings.NewReader(`{"args":["create","x"]}`))
-	req.Header.Set("Tailscale-User-Login", "someone@example.com")
+// fakeTailscale answers `tailscale whois --json <addr>` for two made-up
+// tailnet peers and fails for anything else, the way the real one does for a
+// non-tailnet address.
+func fakeTailscale(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "tailscale")
+	script := `#!/bin/sh
+case "$3" in
+  100.1.1.1) echo '{"Node":{"Name":"dev.example.ts.net.","Tags":["tag:box"]},"UserProfile":{"LoginName":"tagged-devices"}}' ;;
+  100.2.2.2) echo '{"Node":{"Name":"pi.example.ts.net.","Tags":["tag:box"]},"UserProfile":{"LoginName":"tagged-devices"}}' ;;
+  *) echo "no such peer: $3" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// identityServer is a server whose whois goes to the fake, with pi
+// (100.2.2.2) as the one trusted proxy.
+func identityServer(t *testing.T, brScript string) *Server {
+	t.Helper()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	br := filepath.Join(t.TempDir(), "br")
+	if err := os.WriteFile(br, []byte("#!/bin/sh\n"+brScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Repos:          []Repo{{Name: "demo", Path: repoDir}},
+		BrPath:         br,
+		TrustedProxies: []string{"100.2.2.2"},
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.resolver.Path = fakeTailscale(t)
+	return s
+}
+
+// via tags a request with the transport ConnContext would have recorded for
+// a connection from peer, so identity is decided the way it is in production.
+func via(t *testing.T, s *Server, req *http.Request, network, peer string) *http.Request {
+	t.Helper()
+	conn := &fakeConn{network: network, addr: peer}
+	return req.WithContext(s.ConnContext(req.Context(), conn))
+}
+
+type fakeConn struct {
+	net.Conn
+	network, addr string
+}
+
+func (c *fakeConn) RemoteAddr() net.Addr { return fakeAddr{c.network, c.addr} }
+
+type fakeAddr struct{ network, addr string }
+
+func (a fakeAddr) Network() string { return a.network }
+func (a fakeAddr) String() string  { return a.addr }
+
+func createVia(t *testing.T, s *Server, network, peer string, headers map[string]string, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/demo/br", strings.NewReader(body))
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req = via(t, s, req, network, peer)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
 
+// TestTrustedProxyHeadersAreHonoured is the regression guard for the proxy
+// path: through a trusted proxy the forwarded headers are the proxy's word,
+// and today's behaviour must survive unchanged.
+func TestTrustedProxyHeadersAreHonoured(t *testing.T) {
+	s := identityServer(t, `printf '%s' "$BD_ACTOR"`)
+
+	rec := createVia(t, s, "tcp", "100.2.2.2:40000",
+		map[string]string{"Tailscale-User-Login": "someone@example.com"}, `{"args":["create","x"]}`)
 	if got := rec.Body.String(); got != "someone@example.com" {
 		t.Errorf("BD_ACTOR = %q, want the proxy-supplied login", got)
 	}
 	if got := rec.Header().Get("X-Br-Actor-Source"); got != "tailscale-user-header" {
 		t.Errorf("source = %q, want tailscale-user-header", got)
 	}
+
+	// No user header (tagged caller): the proxy's X-Forwarded-For names the
+	// machine. Caddy appends, so the LAST entry is the proxy's own view and a
+	// forged prefix loses.
+	rec = createVia(t, s, "tcp", "100.2.2.2:40001",
+		map[string]string{"X-Forwarded-For": "9.9.9.9, 100.1.1.1"}, `{"args":["create","x"]}`)
+	if got := rec.Body.String(); got != "dev" {
+		t.Errorf("BD_ACTOR = %q, want dev from the proxy's X-Forwarded-For", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor-Source"); got != "tailscale-whois" {
+		t.Errorf("source = %q, want tailscale-whois", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor-Verified"); got != "true" {
+		t.Errorf("verified = %q, want true", got)
+	}
+}
+
+// TestDirectPeerCannotForgeIdentity is the fix: a caller that reaches the TCP
+// listener itself, skipping the proxy, gets its own machine as actor no
+// matter what headers it sends.
+func TestDirectPeerCannotForgeIdentity(t *testing.T) {
+	s := identityServer(t, `printf '%s' "$BD_ACTOR"`)
+
+	forged := map[string]string{
+		"Tailscale-User-Login": "attacker@evil.com",
+		"X-Forwarded-For":      "100.2.2.2",
+	}
+	rec := createVia(t, s, "tcp", "100.1.1.1:50000", forged, `{"args":["create","x"],"actor":"also-claimed"}`)
+	if got := rec.Body.String(); got != "dev" {
+		t.Errorf("BD_ACTOR = %q, want the caller's own machine", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor-Source"); got != "tailscale-whois-direct" {
+		t.Errorf("source = %q, want tailscale-whois-direct", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor-Verified"); got != "true" {
+		t.Errorf("verified = %q, want true — the transport vouches for the peer", got)
+	}
+
+	// And whoami must not echo the forgery anywhere in identity.
+	req := httptest.NewRequest(http.MethodGet, "/v1/whoami", nil)
+	for k, v := range forged {
+		req.Header.Set(k, v)
+	}
+	req = via(t, s, req, "tcp", "100.1.1.1:50001")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	var out struct {
+		Identity  json.RawMessage `json:"identity"`
+		Transport Transport       `json:"transport"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decoding whoami: %v", err)
+	}
+	if strings.Contains(string(out.Identity), "evil") || strings.Contains(string(out.Identity), "100.2.2.2") {
+		t.Errorf("identity = %s, want no trace of the forged headers", out.Identity)
+	}
+	if out.Transport.Network != "tcp" || out.Transport.Peer != "100.1.1.1" || out.Transport.TrustedProxy {
+		t.Errorf("transport = %+v, want tcp from 100.1.1.1, untrusted", out.Transport)
+	}
+}
+
+// TestUnixSocketIgnoresForwardedHeaders: nothing on the local socket can
+// vouch for a header, so only the body's actor counts there.
+func TestUnixSocketIgnoresForwardedHeaders(t *testing.T) {
+	s := identityServer(t, `printf '%s' "$BD_ACTOR"`)
+	forged := map[string]string{"Tailscale-User-Login": "attacker@evil.com", "X-Forwarded-For": "100.1.1.1"}
+
+	rec := createVia(t, s, "unix", "@", forged, `{"args":["create","x"]}`)
+	if got := rec.Body.String(); got != "" {
+		t.Errorf("BD_ACTOR = %q, want unset on the socket with no body actor", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor-Source"); got != "none" {
+		t.Errorf("source = %q, want none", got)
+	}
+
+	rec = createVia(t, s, "unix", "@", forged, `{"args":["create","x"],"actor":"local-agent"}`)
+	if got := rec.Body.String(); got != "local-agent" {
+		t.Errorf("BD_ACTOR = %q, want the self-asserted actor", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor-Verified"); got != "false" {
+		t.Errorf("verified = %q, want false", got)
+	}
+}
+
+// TestUntaggedRequestIsLeastTrusted pins the zero value: a request that
+// never went through ConnContext believes no header.
+func TestUntaggedRequestIsLeastTrusted(t *testing.T) {
+	s := identityServer(t, `printf '%s' "$BD_ACTOR"`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/demo/br", strings.NewReader(`{"args":["create","x"]}`))
+	req.Header.Set("Tailscale-User-Login", "someone@example.com")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if got := rec.Header().Get("X-Br-Actor-Source"); got != "none" {
+		t.Errorf("source = %q, want none for an untagged request", got)
+	}
+}
+
+// TestDirectPeerOffTailnetFallsBackToRequest: a TCP peer whois cannot name
+// (127.0.0.1 in a --listen trial) is not verified, but its self-asserted
+// actor still counts, marked as such.
+func TestDirectPeerOffTailnetFallsBackToRequest(t *testing.T) {
+	s := identityServer(t, `printf '%s' "$BD_ACTOR"`)
+	rec := createVia(t, s, "tcp", "127.0.0.1:60000",
+		map[string]string{"Tailscale-User-Login": "attacker@evil.com"},
+		`{"args":["create","x"],"actor":"me"}`)
+	if got := rec.Body.String(); got != "me" {
+		t.Errorf("BD_ACTOR = %q, want the body actor", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor-Source"); got != "request" {
+		t.Errorf("source = %q, want request", got)
+	}
+}
+
+func TestTrustedProxiesConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{
+		Repos:          []Repo{{Name: "a", Path: dir}},
+		TrustedProxies: []string{"100.2.2.2", "10.0.0.0/8", "fd7a:115c:a1e0::1", "::ffff:192.0.2.9"},
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize() = %v", err)
+	}
+	for addr, want := range map[string]bool{
+		"100.2.2.2":         true,
+		"10.200.3.4":        true,
+		"fd7a:115c:a1e0::1": true,
+		"192.0.2.9":         true, // the v4-mapped entry matches its plain form
+		"::ffff:100.2.2.2":  true, // and a mapped peer matches a plain entry
+		"100.2.2.3":         false,
+		"11.0.0.1":          false,
+	} {
+		if got := cfg.TrustedProxy(netip.MustParseAddr(addr)); got != want {
+			t.Errorf("TrustedProxy(%s) = %v, want %v", addr, got, want)
+		}
+	}
+
+	// Empty means trust no proxy, never "trust everyone".
+	cfg = &Config{Repos: []Repo{{Name: "a", Path: dir}}}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TrustedProxy(netip.MustParseAddr("100.2.2.2")) {
+		t.Error("empty trusted_proxies trusted a peer")
+	}
+
+	// Garbage is a config error that names the entry.
+	cfg = &Config{Repos: []Repo{{Name: "a", Path: dir}}, TrustedProxies: []string{"100.2.2.2", "pi"}}
+	err := cfg.Normalize()
+	if err == nil || !strings.Contains(err.Error(), `trusted_proxies[1] "pi"`) {
+		t.Errorf("Normalize() = %v, want an error naming trusted_proxies[1]", err)
+	}
+}
+
+func TestSocketDefaultDependsOnListen(t *testing.T) {
+	dir := t.TempDir()
+	repos := []Repo{{Name: "a", Path: dir}}
+
+	cfg := &Config{Repos: repos}
+	if err := cfg.Normalize(); err != nil || cfg.Socket == "" || cfg.Listen != "" {
+		t.Errorf("neither set: socket=%q listen=%q err=%v, want the socket default", cfg.Socket, cfg.Listen, err)
+	}
+	cfg = &Config{Repos: repos, Listen: "127.0.0.1:0"}
+	if err := cfg.Normalize(); err != nil || cfg.Socket != "" {
+		t.Errorf("listen only: socket=%q err=%v, want TCP only", cfg.Socket, err)
+	}
+	cfg = &Config{Repos: repos, Socket: "/tmp/x.sock", Listen: "127.0.0.1:0"}
+	if err := cfg.Normalize(); err != nil || cfg.Socket != "/tmp/x.sock" || cfg.Listen != "127.0.0.1:0" {
+		t.Errorf("both: socket=%q listen=%q err=%v, want both kept", cfg.Socket, cfg.Listen, err)
+	}
+	cfg = &Config{Repos: repos, Listen: "no-port"}
+	if err := cfg.Normalize(); err == nil || !strings.Contains(err.Error(), `listen "no-port"`) {
+		t.Errorf("bad listen: err=%v, want an error naming it", err)
+	}
+}
+
+// TestServesSocketAndTCPTogether runs one server on both listeners, tagged by
+// ConnContext, and checks each answers and knows which transport it is.
+func TestServesSocketAndTCPTogether(t *testing.T) {
+	s := identityServer(t, `echo ran`)
+	sock := filepath.Join(t.TempDir(), "bw.sock")
+	uln, err := ListenSocket(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: s.Handler(), ConnContext: s.ConnContext}
+	go srv.Serve(uln)
+	go srv.Serve(tln)
+	defer srv.Close()
+
+	unix := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return net.Dial("unix", sock) },
+	}}
+	for name, c := range map[string]struct {
+		client *http.Client
+		url    string
+		net    string
+	}{
+		"unix": {unix, "http://local/v1/whoami", "unix"},
+		"tcp":  {http.DefaultClient, "http://" + tln.Addr().String() + "/v1/whoami", "tcp"},
+	} {
+		resp, err := c.client.Get(c.url)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		var out struct {
+			Transport Transport `json:"transport"`
+		}
+		json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || resp.Header.Get("X-Beads-Watch-Node") != s.node {
+			t.Errorf("%s: status %d node %q, want 200 from this daemon", name, resp.StatusCode, resp.Header.Get("X-Beads-Watch-Node"))
+		}
+		if out.Transport.Network != c.net {
+			t.Errorf("%s: transport = %+v, want network %s", name, out.Transport, c.net)
+		}
+		if c.net == "tcp" && out.Transport.Peer != "127.0.0.1" {
+			t.Errorf("tcp: peer = %q, want 127.0.0.1", out.Transport.Peer)
+		}
+	}
+	if info, err := os.Stat(sock); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("socket mode = %v (err %v), want 0600", info.Mode().Perm(), err)
+	}
+}
+
+// TestListenTCPBindsUnassignedAddress: at login the tailscale address may not
+// exist yet, so the listener has to bind it anyway (IP_FREEBIND). 192.0.2.0/24
+// is TEST-NET-1, assigned to no interface anywhere.
+func TestListenTCPBindsUnassignedAddress(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("IP_FREEBIND is linux-only")
+	}
+	if ln, err := net.Listen("tcp", "192.0.2.1:0"); err == nil {
+		ln.Close()
+		t.Skip("192.0.2.1 is assigned on this box; cannot tell freebind from a plain bind")
+	}
+	ln, err := ListenTCP("192.0.2.1:0")
+	if err != nil {
+		t.Fatalf("ListenTCP on an unassigned address: %v, want IP_FREEBIND to allow it", err)
+	}
+	ln.Close()
 }
 
 func TestBodyLimits(t *testing.T) {
