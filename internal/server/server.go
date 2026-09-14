@@ -171,7 +171,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if Commit != "" {
 		body["commit"] = Commit
 	}
+	// A repo whose path is not usable right now is still served in name, so
+	// it counts in "repos"; this is the signal that some of them will answer
+	// 503. A stat per repo is cheap enough for a liveness check, and it stays
+	// honest: the number reflects the box as it is, not as it was at startup.
+	if n := s.unavailable(); n > 0 {
+		body["repos_unavailable"] = n
+	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+func (s *Server) unavailable() int {
+	n := 0
+	for _, repo := range s.cfg.Repos {
+		if repo.Probe() != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // handleWhoami reports exactly which identity headers arrived. Tagged devices
@@ -221,6 +238,14 @@ func (s *Server) handleRepos(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			st := repoStatus{Name: repo.Name, Path: repo.Path}
 
+			// A path that is not there is reported as itself rather than as
+			// br's chdir failure, and costs no fork.
+			if err := repo.Probe(); err != nil {
+				st.Error = err.Error()
+				out[i] = st
+				return
+			}
+
 			ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeout())
 			defer cancel()
 
@@ -265,6 +290,19 @@ func (s *Server) handleBr(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "REPO_NOT_FOUND",
 			fmt.Sprintf("This node does not serve a repo named %q.", repoName),
 			"GET /v1/repos lists the repos this node serves.")
+		return
+	}
+	// Probed now rather than trusted from startup, so a checkout that arrived
+	// since then answers and one that left since then is refused. Running br
+	// anyway would fail on chdir with a message that reads like a daemon bug.
+	// The hint names the sandbox case because "no such file" is misleading
+	// when the operator can ls the path themselves: the unit's namespace may
+	// simply not include it.
+	if err := repo.Probe(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "REPO_UNAVAILABLE",
+			fmt.Sprintf("The repo %q is configured on this node but its path is not usable: %v.", repo.Name, err),
+			"The checkout may be missing from this box, or hidden from the service by its sandbox "+
+				"(PrivateTmp, ProtectHome, BindPaths). GET /v1/repos shows every repo's state.")
 		return
 	}
 

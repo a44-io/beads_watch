@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"beads_watch/internal/events"
@@ -20,7 +21,32 @@ type Repo struct {
 	// Path is the directory br runs in. br walks up from here to find .beads,
 	// which is what lets a .beads/redirect file point somewhere else entirely.
 	Path string `json:"path"`
+
+	// err is why Path was unusable when the config was normalized, or nil. A
+	// missing checkout is a fact about this box — archived, never cloned here,
+	// or hidden by the unit's sandbox — not a typo in the config, so it is
+	// recorded rather than fatal and the daemon keeps serving every other repo.
+	err error
 }
+
+// Probe reports whether Path is a directory this process can see right now.
+// It is cheap enough to run per request, which is what lets a repo cloned
+// after startup start answering without a restart.
+func (r Repo) Probe() error {
+	info, err := os.Stat(r.Path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", r.Path)
+	}
+	return nil
+}
+
+// Err is the startup probe's verdict: nil when Path stat'd cleanly, otherwise
+// why it did not. Request handlers re-probe instead of trusting this, since
+// the answer can change under a running daemon.
+func (r Repo) Err() error { return r.err }
 
 // Config is the daemon's whole configuration.
 type Config struct {
@@ -118,6 +144,16 @@ func LoadConfig(path string) (*Config, error) {
 
 // Normalize fills in defaults and rejects configurations that would misbehave
 // at request time rather than at startup.
+//
+// Two kinds of repo trouble are told apart here. A config-shaped error — no
+// path, an unsafe name, a name used twice, notify naming a repo that is not
+// served — is a typo the operator has to fix, and retrying cannot help, so it
+// is returned and the daemon exits. An environment-shaped one — the path is
+// gone, or is not a directory — is ordinary drift on a multi-machine setup and
+// is recorded on the Repo instead, so one archived checkout cannot take every
+// healthy repo offline with it. The one exception is when no repo at all
+// survives the probe: a daemon that comes up and serves nothing is worse than
+// one that refuses to start, so that case stays fatal.
 func (c *Config) Normalize() error {
 	if c.Socket == "" {
 		c.Socket = DefaultSocket()
@@ -145,6 +181,7 @@ func (c *Config) Normalize() error {
 	}
 
 	seen := make(map[string]string, len(c.Repos))
+	var unservable []string
 	for i := range c.Repos {
 		r := &c.Repos[i]
 		if r.Path == "" {
@@ -166,13 +203,12 @@ func (c *Config) Normalize() error {
 		}
 		seen[r.Name] = r.Path
 
-		info, err := os.Stat(r.Path)
-		if err != nil {
-			return fmt.Errorf("repo %q: %w", r.Name, err)
+		if r.err = r.Probe(); r.err != nil {
+			unservable = append(unservable, fmt.Sprintf("%q: %v", r.Name, r.err))
 		}
-		if !info.IsDir() {
-			return fmt.Errorf("repo %q: %s is not a directory", r.Name, r.Path)
-		}
+	}
+	if len(unservable) == len(c.Repos) {
+		return fmt.Errorf("no servable repos: %s", strings.Join(unservable, "; "))
 	}
 
 	if c.Notify != nil {
@@ -189,7 +225,10 @@ func (c *Config) Normalize() error {
 }
 
 // NotifyRepos is the subset of served repos the notify block watches: the
-// named subset when one is given, otherwise every served repo.
+// named subset when one is given, otherwise every served repo. A repo whose
+// path failed the startup probe is left out — there is nothing there to tail,
+// and the watcher would only repeat once a minute what the startup warning
+// already said.
 func (c *Config) NotifyRepos() []events.Repo {
 	if c.Notify == nil {
 		return nil
@@ -200,8 +239,22 @@ func (c *Config) NotifyRepos() []events.Repo {
 	}
 	var out []events.Repo
 	for _, r := range c.Repos {
+		if r.err != nil {
+			continue
+		}
 		if len(want) == 0 || want[r.Name] {
 			out = append(out, events.Repo{Name: r.Name, Path: r.Path})
+		}
+	}
+	return out
+}
+
+// Unavailable is every repo whose path failed the startup probe.
+func (c *Config) Unavailable() []Repo {
+	var out []Repo
+	for _, r := range c.Repos {
+		if r.err != nil {
+			out = append(out, r)
 		}
 	}
 	return out

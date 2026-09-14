@@ -115,6 +115,11 @@ Liveness. Runs no `br`, so it stays up even when a repo is broken.
 { "node": "dev", "ok": true, "repos": 5, "version": "1.0.3" }
 ```
 
+`repos` counts every configured repo, including any whose path is not usable
+on this box right now. When there are some, a `repos_unavailable` count
+appears beside it; when there are none, the field is absent. That is the
+one-glance signal that some `POST /v1/repos/{repo}/br` calls will answer 503.
+
 ### `GET /v1/repos`
 
 The repos this node serves. Per-repo detail comes from `br where` itself. The
@@ -137,7 +142,9 @@ daemon does not know a repo's prefix or database path, so it asks:
 Because the answer comes from `br`, a `.beads/redirect` resolves correctly
 here and shows up as a `redirected_from` field. A repo whose path is unusable
 comes back `"ok": false` with an `error` instead of `where`; the listing does
-not fail as a whole.
+not fail as a whole. A path that is missing outright is reported from a
+`stat`, without running `br` in it, so the error reads `stat …: no such file
+or directory` rather than a `chdir` failure out of the exec.
 
 ### `GET /v1/whoami`
 
@@ -213,6 +220,7 @@ and a partial-batch failure writes **two** JSON documents to stdout. Parse with
 | Proxy not configured | TLS/connection error |
 | `br` exceeded the timeout | HTTP 504, `BR_TIMEOUT` |
 | Repo not served here | HTTP 404, `REPO_NOT_FOUND` |
+| Repo configured, path unusable on this node | HTTP 503, `REPO_UNAVAILABLE` |
 | Subcommand off the allowlist | HTTP 403, `COMMAND_NOT_ALLOWED` |
 | `--db` or `--actor` in args | HTTP 403, `FLAG_NOT_ALLOWED` |
 | Malformed body, empty args | HTTP 400, `BAD_REQUEST` / `EMPTY_ARGS` |
@@ -220,6 +228,12 @@ and a partial-batch failure writes **two** JSON documents to stdout. Parse with
 The 502-with-empty-body case is the one to branch on for a fallback to local
 `br`. Checking for the `X-Beads-Watch-Version` header distinguishes "this
 daemon answered" from "something else did".
+
+`REPO_UNAVAILABLE` is the other fallback-worthy case: the daemon is up and
+knows the repo by name, but the checkout is not on this box, or the unit's
+sandbox cannot see it. The path is probed on every request, so a `git clone`
+that lands later starts answering with no restart, and a checkout that
+disappears is refused rather than handed to `br` to fail on `chdir`.
 
 ## Identity
 
@@ -498,7 +512,7 @@ instead of silently doing nothing.
 |---|---|---|
 | `socket` | `$XDG_RUNTIME_DIR/beads_watch.sock` | Unix socket to bind. |
 | `repos[].name` | basename of `path` | URL path segment. An alias, so a repo can be renamed on the wire without moving on disk. |
-| `repos[].path` | required | Directory `br` runs in. `br` walks up from here to find `.beads`. |
+| `repos[].path` | required | Directory `br` runs in. `br` walks up from here to find `.beads`. A path that is missing on this box is served as unavailable (one startup warning, `ok: false` in `/v1/repos`, 503 on `br`), not treated as a config error; only *every* path missing is fatal. |
 | `allow` | the read commands plus create/claim/close | **Replaces** the default allowlist; it does not extend it. |
 | `br_path` | `br` on `PATH` | The `br` binary to exec. |
 | `timeout_seconds` | `30` | Per-request `br` timeout. |
@@ -520,22 +534,33 @@ systemctl --user status beads_watch
 journalctl --user -u beads_watch -n 50
 ```
 
-### `stat /path/to/repo: no such file or directory`, over and over
+### `repo path unusable, serving it as unavailable` in the journal
 
-A configured repo path is gone, and startup validation currently treats that as
-fatal, so one dead entry takes every healthy repo down with it and the unit
-restarts every 2s forever. Remove the entry (or restore the directory) and
-restart:
+A configured repo path is gone, or is not a directory. The daemon says so once
+at startup, keeps serving every other repo, and answers `503 REPO_UNAVAILABLE`
+for that one. It is worth fixing anyway, because a repo that is quietly
+missing on one box is exactly the kind of drift nobody notices: either restore
+the directory (a `git clone` is enough, no restart needed, since the path is
+probed per request) or drop the entry from the config.
 
 ```bash
-beads_watch --print-config     # fails on the offending repo, names it
-systemctl --user restart beads_watch
+beads_watch --print-config     # warns on stderr, names each unusable repo
+curl -s --unix-socket /run/user/1000/beads_watch.sock http://local/v1/repos \
+  | jq '.repos[] | select(.ok | not)'
 ```
 
 If the path exists when *you* look but not for the service, the unit's sandbox
 is hiding it: `PrivateTmp=true` gives the service its own `/tmp`, and
 `ProtectHome`/`ProtectSystem` restrict the rest. The error text is identical in
-both cases, which makes this one easy to misread.
+both cases, which makes this one easy to misread; the 503's hint says as much.
+
+### `no servable repos: …` and the unit will not start
+
+Every configured path failed. That is a config error, not drift, and the
+daemon refuses rather than coming up to serve nothing. The message lists each
+repo with its own reason. Also expect this when the unit's sandbox hides
+*all* of them, for instance every repo under a directory the service cannot
+see.
 
 ### `json: unknown field "..."` at startup
 
@@ -580,9 +605,11 @@ to check.
 
 ## Limitations
 
-- **One bad repo path stops everything.** Startup stats every configured path
-  and exits on the first failure, so a deleted repo crash-loops the daemon and
-  takes the healthy repos with it. Tracked in beads.
+- **A genuine config error still restarts forever.** A missing repo path no
+  longer stops the daemon, but a real config mistake (a typo'd key, every
+  path missing) still exits non-zero and the unit's `Restart=on-failure`
+  retries it every 2s indefinitely, showing as `activating (auto-restart)`
+  rather than `failed`. Tracked in beads.
 - **Forwarded identity is trusted from any peer.** A caller that reaches the
   bridge port directly, skipping caddy, can set `Tailscale-User-Login` or
   `X-Forwarded-For` and mint a verified actor. `systemd-socket-proxyd` erases

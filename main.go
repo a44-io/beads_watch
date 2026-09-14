@@ -93,13 +93,25 @@ func run() error {
 		return err
 	}
 
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// A repo whose path did not stat is served in name only: GET /v1/repos
+	// lists it as ok:false, POST /v1/repos/{repo}/br answers 503, and every
+	// request re-probes it so a later clone heals it without a restart. One
+	// line per repo, once, so the journal explains the gap without becoming
+	// the crash loop this replaced. Emitted before --print-config too, since
+	// that is how an operator checks a config before wiring systemd.
+	unavailable := cfg.Unavailable()
+	for _, r := range unavailable {
+		log.Warn("repo path unusable, serving it as unavailable",
+			"repo", r.Name, "path", r.Path, "err", r.Err())
+	}
+
 	if *printConfig {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(cfg)
 	}
-
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	// A unix socket is the preferred transport: mode 0600 keeps every other
 	// local user out, which matters on a box running agent swarms. TCP exists
@@ -148,7 +160,15 @@ func run() error {
 	for i, r := range cfg.Repos {
 		names[i] = r.Name
 	}
-	log.Info("serving", "addr", addr, "repos", strings.Join(names, ","), "version", server.Version)
+	attrs := []any{"addr", addr, "repos", strings.Join(names, ","), "version", server.Version}
+	if len(unavailable) > 0 {
+		bad := make([]string, len(unavailable))
+		for i, r := range unavailable {
+			bad[i] = r.Name
+		}
+		attrs = append(attrs, "unavailable", strings.Join(bad, ","))
+	}
+	log.Info("serving", attrs...)
 
 	select {
 	case err := <-errCh:

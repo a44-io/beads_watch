@@ -15,24 +15,35 @@ import (
 
 func testServer(t *testing.T, brScript string) (*Server, string) {
 	t.Helper()
-	dir := t.TempDir()
-	repoDir := filepath.Join(dir, "repo")
+	repoDir := filepath.Join(t.TempDir(), "repo")
 	if err := os.MkdirAll(repoDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	br := filepath.Join(dir, "br")
+	return serverFor(t, brScript, Repo{Name: "demo", Path: repoDir}), repoDir
+}
+
+// serverFor builds a Server over exactly these repos and a fake br. Paths
+// need not exist; at least one must, or Normalize refuses to serve nothing.
+func serverFor(t *testing.T, brScript string, repos ...Repo) *Server {
+	t.Helper()
+	br := filepath.Join(t.TempDir(), "br")
 	if err := os.WriteFile(br, []byte("#!/bin/sh\n"+brScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &Config{
-		Repos:  []Repo{{Name: "demo", Path: repoDir}},
-		BrPath: br,
-	}
+	cfg := &Config{Repos: repos, BrPath: br}
 	if err := cfg.Normalize(); err != nil {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(cfg, log), repoDir
+	return New(cfg, log)
+}
+
+func get(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	return rec
 }
 
 func post(t *testing.T, s *Server, repo, body string) *httptest.ResponseRecorder {
@@ -232,6 +243,156 @@ func TestHealthNeedsNoBr(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200 even when br is broken", rec.Code)
+	}
+}
+
+// mixedRepos is one repo that exists and one whose path does not — the
+// partially-broken config that used to crash-loop the daemon.
+func mixedRepos(t *testing.T) (good, ghost Repo) {
+	t.Helper()
+	dir := t.TempDir()
+	goodDir := filepath.Join(dir, "good")
+	if err := os.MkdirAll(goodDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return Repo{Name: "good", Path: goodDir}, Repo{Name: "ghost", Path: filepath.Join(dir, "ghost")}
+}
+
+func decodeError(t *testing.T, rec *httptest.ResponseRecorder) (code, message, hint string) {
+	t.Helper()
+	var out struct {
+		Error struct{ Code, Message, Hint string } `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decoding error envelope %q: %v", rec.Body.String(), err)
+	}
+	return out.Error.Code, out.Error.Message, out.Error.Hint
+}
+
+// TestUnavailableRepoIsRefusedNotExecuted: a repo whose path is gone answers
+// with a daemon-level 503 that says so, instead of br's chdir failure dressed
+// up as BR_EXEC_FAILED — and the healthy repo beside it keeps working.
+func TestUnavailableRepoIsRefusedNotExecuted(t *testing.T) {
+	good, ghost := mixedRepos(t)
+	s := serverFor(t, `echo ran`, good, ghost)
+
+	rec := post(t, s, "ghost", `{"args":["ready"]}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Br-Exit") != "" {
+		t.Error("X-Br-Exit present though br never ran")
+	}
+	code, msg, hint := decodeError(t, rec)
+	if code != "REPO_UNAVAILABLE" {
+		t.Errorf("code = %q, want REPO_UNAVAILABLE", code)
+	}
+	if !strings.Contains(msg, "ghost") || !strings.Contains(msg, "no such file") {
+		t.Errorf("message = %q, want the repo name and the stat error", msg)
+	}
+	// The sandbox case is the misleading one: the path exists for the operator
+	// and not for the unit, and the hint has to say so.
+	if !strings.Contains(hint, "ProtectHome") {
+		t.Errorf("hint = %q, want it to mention unit sandboxing", hint)
+	}
+
+	if rec := post(t, s, "good", `{"args":["ready"]}`); rec.Code != http.StatusOK {
+		t.Errorf("good: status = %d, want 200 — the ghost must not take it down", rec.Code)
+	}
+}
+
+// TestUnavailableRepoHealsWithoutRestart: the probe is per request, so a
+// clone that lands after startup starts answering on the next call.
+func TestUnavailableRepoHealsWithoutRestart(t *testing.T) {
+	good, ghost := mixedRepos(t)
+	s := serverFor(t, `echo ran`, good, ghost)
+
+	if rec := post(t, s, "ghost", `{"args":["ready"]}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("before clone: status = %d, want 503", rec.Code)
+	}
+	if err := os.MkdirAll(ghost.Path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if rec := post(t, s, "ghost", `{"args":["ready"]}`); rec.Code != http.StatusOK {
+		t.Errorf("after clone: status = %d, want 200 with no restart", rec.Code)
+	}
+
+	// And the reverse: a checkout that disappears is refused, not exec'd.
+	if err := os.RemoveAll(good.Path); err != nil {
+		t.Fatal(err)
+	}
+	if rec := post(t, s, "good", `{"args":["ready"]}`); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("after removal: status = %d, want 503", rec.Code)
+	}
+}
+
+func TestReposListsUnavailableRepoWithoutRunningBr(t *testing.T) {
+	good, ghost := mixedRepos(t)
+	// The fake br records every invocation, so the test can see that the
+	// ghost repo cost no fork.
+	calls := filepath.Join(t.TempDir(), "calls")
+	s := serverFor(t, `pwd >> `+calls+`; echo '{"prefix":"t"}'`, good, ghost)
+
+	rec := get(t, s, "/v1/repos")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var out struct {
+		Repos []struct {
+			Name  string          `json:"name"`
+			OK    bool            `json:"ok"`
+			Where json.RawMessage `json:"where"`
+			Error string          `json:"error"`
+		} `json:"repos"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	byName := map[string]int{}
+	for i, r := range out.Repos {
+		byName[r.Name] = i
+	}
+	g := out.Repos[byName["good"]]
+	if !g.OK || len(g.Where) == 0 || g.Error != "" {
+		t.Errorf("good = %+v, want ok with a where block", g)
+	}
+	gh := out.Repos[byName["ghost"]]
+	if gh.OK || gh.Error == "" || !strings.Contains(gh.Error, "no such file") {
+		t.Errorf("ghost = %+v, want ok:false with the stat error", gh)
+	}
+
+	raw, _ := os.ReadFile(calls)
+	if got := strings.TrimSpace(string(raw)); got != good.Path {
+		t.Errorf("br ran in %q, want only %q — a missing path must not be exec'd", got, good.Path)
+	}
+}
+
+func TestHealthCountsUnavailableRepos(t *testing.T) {
+	good, ghost := mixedRepos(t)
+	s := serverFor(t, `exit 1`, good, ghost)
+
+	var body map[string]any
+	rec := get(t, s, "/v1/health")
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if body["ok"] != true || body["repos"] != float64(2) {
+		t.Errorf("health = %v, want ok with both repos counted as served", body)
+	}
+	if body["repos_unavailable"] != float64(1) {
+		t.Errorf("repos_unavailable = %v, want 1", body["repos_unavailable"])
+	}
+
+	// The field is a signal, not a constant: absent when there is nothing
+	// to report, like commit on a source build.
+	s = serverFor(t, `exit 1`, good)
+	body = nil
+	rec = get(t, s, "/v1/health")
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if _, present := body["repos_unavailable"]; present {
+		t.Errorf("health = %v, want no repos_unavailable when every repo is fine", body)
 	}
 }
 
