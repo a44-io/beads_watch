@@ -258,7 +258,7 @@ func (s *Server) handleRepos(w http.ResponseWriter, r *http.Request) {
 			case err != nil:
 				st.Error = err.Error()
 			case res.ExitCode != 0:
-				st.Error = fmt.Sprintf("br exited %d: %s", res.ExitCode, firstLine(res.Stdout, res.Stderr))
+				st.Error = fmt.Sprintf("br exited %d: %s", res.ExitCode, res.ErrorMessage())
 			case json.Valid(res.Stdout):
 				st.OK = true
 				st.Where = json.RawMessage(res.Stdout)
@@ -551,21 +551,4 @@ func writeError(w http.ResponseWriter, status int, code, message, hint string) {
 			"source":  "beads_watch",
 		},
 	})
-}
-
-func firstLine(streams ...[]byte) string {
-	for _, s := range streams {
-		t := strings.TrimSpace(string(s))
-		if t == "" {
-			continue
-		}
-		if i := strings.IndexByte(t, '\n'); i >= 0 {
-			t = t[:i]
-		}
-		if len(t) > 200 {
-			t = t[:200]
-		}
-		return t
-	}
-	return "no output"
 }

@@ -7,11 +7,13 @@ package brexec
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ErrTimeout means br was still running when the deadline expired.
@@ -60,6 +62,88 @@ type Result struct {
 	// 0 ok, 2 database, 3 not-found, 4 validation, 5 cycle, 6 sync, 7 config, 8 I/O.
 	ExitCode int
 	Duration time.Duration
+}
+
+// maxExcerpt bounds the one-line diagnostics below. They render inline
+// beside a repo name in whatever consumer shows them, so they are elided,
+// not wrapped.
+const maxExcerpt = 200
+
+// ErrorMessage is what a failed invocation said, as one line for a log or a
+// status field. br writes its error envelope — {"error":{"code","message",
+// "hint",…}} — pretty-printed to stdout, so the first line of that stream is
+// a bare brace and says nothing; when an envelope is there its message is
+// relayed, with the hint appended. This is the one place br's output is read
+// rather than passed through, and it reads a contract without depending on
+// it: anything that does not fit the shape degrades to the plain-text path,
+// never to an empty string.
+func (r *Result) ErrorMessage() string {
+	for _, s := range [][]byte{r.Stdout, r.Stderr} {
+		if msg := envelopeMessage(s); msg != "" {
+			return msg
+		}
+	}
+	// stderr first: that is where a plain-text failure — a usage error, a
+	// panic, sqlite3's "Error: …" — lands, while stdout at that point is
+	// partial output at best.
+	return Excerpt(r.Stderr, r.Stdout)
+}
+
+func envelopeMessage(s []byte) string {
+	// json.Valid first, so a text stream that happens to start with a brace
+	// never reaches the decoder.
+	if !json.Valid(s) {
+		return ""
+	}
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Hint    string `json:"hint"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(s, &env); err != nil {
+		return ""
+	}
+	msg := strings.TrimSpace(env.Error.Message)
+	if msg == "" {
+		return ""
+	}
+	if hint := strings.TrimSpace(env.Error.Hint); hint != "" {
+		msg += " (hint: " + hint + ")"
+	}
+	return elide(msg)
+}
+
+// Excerpt is the first non-empty stream, in the order given, as one line:
+// newlines are joined with " / " so a multi-line message still says
+// something, and the result is elided at maxExcerpt bytes. "no output" when
+// every stream is empty.
+func Excerpt(streams ...[]byte) string {
+	for _, s := range streams {
+		t := strings.TrimSpace(string(s))
+		if t == "" {
+			continue
+		}
+		var lines []string
+		for _, l := range strings.Split(t, "\n") {
+			if l = strings.TrimSpace(l); l != "" {
+				lines = append(lines, l)
+			}
+		}
+		return elide(strings.Join(lines, " / "))
+	}
+	return "no output"
+}
+
+func elide(s string) string {
+	if len(s) <= maxExcerpt {
+		return s
+	}
+	cut := maxExcerpt
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // Runner executes br. It is safe for concurrent use.

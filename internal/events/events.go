@@ -158,7 +158,7 @@ func (t *repoTail) resolve(ctx context.Context) error {
 		return fmt.Errorf("br where: %w", err)
 	}
 	if res.ExitCode != 0 {
-		return fmt.Errorf("br where exited %d: %s", res.ExitCode, firstLine(res.Stderr, res.Stdout))
+		return fmt.Errorf("br where exited %d: %s", res.ExitCode, res.ErrorMessage())
 	}
 	var where struct {
 		DatabasePath string `json:"database_path"`
@@ -336,7 +336,7 @@ func (t *repoTail) query(ctx context.Context, sql string) ([]map[string]any, err
 		return nil, fmt.Errorf("sqlite3: %w", err)
 	}
 	if res.ExitCode != 0 {
-		return nil, fmt.Errorf("sqlite3 exited %d: %s", res.ExitCode, firstLine(res.Stderr, res.Stdout))
+		return nil, fmt.Errorf("sqlite3 exited %d: %s", res.ExitCode, res.ErrorMessage())
 	}
 	out := strings.TrimSpace(string(res.Stdout))
 	if out == "" {
@@ -449,19 +449,3 @@ func asInt64(v any) int64 {
 	return int64(f)
 }
 
-func firstLine(streams ...[]byte) string {
-	for _, s := range streams {
-		t := strings.TrimSpace(string(s))
-		if t == "" {
-			continue
-		}
-		if i := strings.IndexByte(t, '\n'); i >= 0 {
-			t = t[:i]
-		}
-		if len(t) > 200 {
-			t = t[:200]
-		}
-		return t
-	}
-	return "no output"
-}

@@ -367,6 +367,51 @@ func TestReposListsUnavailableRepoWithoutRunningBr(t *testing.T) {
 	}
 }
 
+// TestReposRelaysBrErrorMessage: br pretty-prints its error envelope to
+// stdout and exits 2, so the first line of that stream is "{". The error
+// field exists to say why a repo is broken, and a brace says nothing.
+func TestReposRelaysBrErrorMessage(t *testing.T) {
+	s, _ := testServer(t, `cat <<'EOF'
+{
+  "error": {
+    "code": "NOT_INITIALIZED",
+    "message": "Beads not initialized: run 'br init' first",
+    "hint": "Run: br init",
+    "retryable": false,
+    "context": null
+  }
+}
+EOF
+exit 2`)
+
+	rec := get(t, s, "/v1/repos")
+	var out struct {
+		Repos []struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		} `json:"repos"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	r := out.Repos[0]
+	want := "br exited 2: Beads not initialized: run 'br init' first (hint: Run: br init)"
+	if r.OK || r.Error != want {
+		t.Errorf("error = %q, want %q", r.Error, want)
+	}
+
+	// Plain-text failures keep every line, joined, not just the first.
+	s, _ = testServer(t, `echo 'thread main panicked' >&2; echo '  at src/x.rs:1' >&2; exit 101`)
+	rec = get(t, s, "/v1/repos")
+	out.Repos = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if got := out.Repos[0].Error; got != "br exited 101: thread main panicked / at src/x.rs:1" {
+		t.Errorf("error = %q, want both stderr lines joined", got)
+	}
+}
+
 func TestHealthCountsUnavailableRepos(t *testing.T) {
 	good, ghost := mixedRepos(t)
 	s := serverFor(t, `exit 1`, good, ghost)

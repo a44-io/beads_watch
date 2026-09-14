@@ -151,6 +151,82 @@ func TestOutputIsCapped(t *testing.T) {
 	}
 }
 
+// envelope is br 0.2.22's error envelope as it actually arrives: on stdout,
+// pretty-printed, so its first line is a bare brace.
+const envelope = `{
+  "error": {
+    "code": "NOT_INITIALIZED",
+    "message": "Beads not initialized: run 'br init' first",
+    "hint": "Run: br init",
+    "retryable": false,
+    "context": null
+  }
+}
+`
+
+func TestErrorMessageReadsBrEnvelope(t *testing.T) {
+	cases := []struct {
+		name           string
+		stdout, stderr string
+		want           string
+	}{
+		{"envelope on stdout", envelope, "", "Beads not initialized: run 'br init' first (hint: Run: br init)"},
+		{"envelope on stderr, stdout empty", "", envelope, "Beads not initialized: run 'br init' first (hint: Run: br init)"},
+		{"envelope without hint", `{"error":{"code":"X","message":"just this"}}`, "", "just this"},
+		{"envelope with blank hint", `{"error":{"message":"m","hint":"  "}}`, "", "m"},
+		{"envelope wins over stderr noise", envelope, "warning: something\n", "Beads not initialized: run 'br init' first (hint: Run: br init)"},
+		// br's contract is parsed, not depended on: a shape that does not fit
+		// falls through to the text path, never to an empty field.
+		{"valid JSON without error.message", `{"ok":true}`, "", `{"ok":true}`},
+		{"valid JSON, error is not an object", `{"error":"plain"}`, "", `{"error":"plain"}`},
+		{"stdout starts with a brace but is not JSON", "{ not json\nline two", "", "{ not json / line two"},
+		// Plain text: stderr first, newlines joined, nothing cut at the first one.
+		{"plain multi-line stderr", "", "error: bad thing\n  at line 3\n\ncaused by: x\n", "error: bad thing / at line 3 / caused by: x"},
+		{"stderr preferred over stdout for text", "partial output", "the real error", "the real error"},
+		{"only stdout text", "usage: br <cmd>", "", "usage: br <cmd>"},
+		{"both empty", "", "  \n", "no output"},
+	}
+	for _, c := range cases {
+		r := &Result{Stdout: []byte(c.stdout), Stderr: []byte(c.stderr), ExitCode: 2}
+		if got := r.ErrorMessage(); got != c.want {
+			t.Errorf("%s: ErrorMessage() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestErrorMessageElidesAt200Bytes(t *testing.T) {
+	long := strings.Repeat("x", 300)
+	got := (&Result{Stderr: []byte(long)}).ErrorMessage()
+	if len([]rune(got)) != 201 || !strings.HasSuffix(got, "…") {
+		t.Errorf("len = %d, want 200 chars plus an ellipsis; got %q…", len([]rune(got)), got[:20])
+	}
+
+	// The envelope path is capped the same way: a long hint must not blow
+	// past the inline budget.
+	env := `{"error":{"message":"m","hint":"` + long + `"}}`
+	got = (&Result{Stdout: []byte(env)}).ErrorMessage()
+	if !strings.HasPrefix(got, "m (hint: xxx") || !strings.HasSuffix(got, "…") || len(got) > 204 {
+		t.Errorf("envelope path not elided: len %d, %q…", len(got), got[:20])
+	}
+
+	// Elision lands on a rune boundary, never in the middle of a multibyte
+	// character.
+	multi := strings.Repeat("é", 150) // 300 bytes
+	got = Excerpt([]byte(multi))
+	if !utf8ValidString(got) || !strings.HasSuffix(got, "…") {
+		t.Errorf("elided mid-rune: %q", got)
+	}
+}
+
+func utf8ValidString(s string) bool {
+	for _, r := range s {
+		if r == '�' {
+			return false
+		}
+	}
+	return true
+}
+
 func TestMissingBinaryIsDaemonError(t *testing.T) {
 	r := &Runner{Path: filepath.Join(t.TempDir(), "does-not-exist")}
 	if _, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Args: []string{"ready"}}); err == nil {

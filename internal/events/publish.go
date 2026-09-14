@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"beads_watch/internal/brexec"
 )
 
 // Event is the JSON body of every published message: the audit row br wrote,
@@ -108,7 +110,7 @@ func (w *Watcher) publish(ctx context.Context, topic, title string, tags []strin
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		peek, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return fmt.Errorf("ntfy %s: %s: %s", topic, resp.Status, firstLine(peek))
+		return fmt.Errorf("ntfy %s: %s: %s", topic, resp.Status, brexec.Excerpt(peek))
 	}
 	return nil
 }
