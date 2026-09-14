@@ -24,9 +24,14 @@
 #   --dist-url URL    artifact base URL (http://, https://, file://, or a
 #                     plain directory); also BW_DIST_URL
 #   --from-source     ignore prebuilt binaries; always build with go
-#   --force           reinstall even when the installed commit is current
+#   --force           reinstall the binary even when the installed commit is
+#                     current; never touches an existing config
 #   --yes, -y         accept the default answer for every prompt
 #   --repo NAME=PATH  serve this repo; repeatable, and suppresses discovery
+#   --rewrite-config  refresh the repos list in an existing config.json from
+#                     discovery (or --repo); every other key is kept, and a
+#                     timestamped backup is written first. Without it an
+#                     existing config is never touched.
 #   --no-config       do not create or touch ~/.config/beads_watch/config.json
 #   --no-units        do not install the systemd user units
 #   --no-start        install the units but do not start them
@@ -77,6 +82,7 @@ NO_CHECKSUM=0
 DRY_RUN=0
 DO_UNINSTALL=0
 NO_CONFIG=0
+REWRITE_CONFIG=0
 NO_UNITS=0
 NO_START=0
 CLI_REPOS=()
@@ -224,6 +230,7 @@ while [[ $# -gt 0 ]]; do
     --force) FORCE=1; shift ;;
     --yes | -y) ASSUME_YES=1; shift ;;
     --no-config) NO_CONFIG=1; shift ;;
+    --rewrite-config) REWRITE_CONFIG=1; shift ;;
     --no-units) NO_UNITS=1; shift ;;
     --no-start) NO_START=1; shift ;;
     --no-verify) NO_CHECKSUM=1; shift ;;
@@ -237,6 +244,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$BRIDGE_PORT" =~ ^[0-9]+$ ]] || die "--port wants a number, got '$BRIDGE_PORT'" 2
+[[ "$NO_CONFIG" -eq 1 && "$REWRITE_CONFIG" -eq 1 ]] && die "--no-config and --rewrite-config contradict each other" 2
 
 # ── Platform ────────────────────────────────────────────────────────────────
 
@@ -560,12 +568,32 @@ discover_repos() { # prints name<TAB>path for every .beads workspace under $HOME
   done
 }
 
+# What this run will do to the config, in one line, shared by the plan and the
+# phase so --dry-run cannot describe one thing and the run do another.
+config_plan() {
+  if [[ "$NO_CONFIG" -eq 1 ]]; then
+    echo "skipped (--no-config)"
+  elif [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "$CONFIG_FILE (new; repos from $([[ ${#CLI_REPOS[@]} -gt 0 ]] && echo '--repo' || echo 'discovery'))"
+  elif [[ "$REWRITE_CONFIG" -eq 1 ]]; then
+    echo "$CONFIG_FILE (rewrite: repos from $([[ ${#CLI_REPOS[@]} -gt 0 ]] && echo '--repo' || echo 'discovery'), other keys kept, backup first)"
+  else
+    echo "$CONFIG_FILE (exists; left alone)"
+  fi
+}
+
 setup_config() {
   [[ "$NO_CONFIG" -eq 1 ]] && { info "config skipped (--no-config)"; return 0; }
   phase "Config"
 
-  if [[ -f "$CONFIG_FILE" && "$FORCE" -eq 0 ]]; then
-    ok "config exists: $CONFIG_FILE (left alone; --force to rewrite)"
+  # An existing config is the operator's, and --force is about the binary.
+  # Discovery only knows how to produce a repos list, so regenerating from it
+  # would drop notify, allow, br_path and the rest — and the daemon would come
+  # up green with the event feed silently gone. Only the explicit flag
+  # rewrites, and even then it merges rather than replaces.
+  if [[ -f "$CONFIG_FILE" && "$REWRITE_CONFIG" -eq 0 ]]; then
+    ok "config exists: $CONFIG_FILE (left alone; --rewrite-config to refresh repos)"
+    [[ ${#CLI_REPOS[@]} -gt 0 ]] && warn "--repo ignored: the config already exists (add --rewrite-config to apply it)"
     return 0
   fi
 
@@ -595,32 +623,90 @@ setup_config() {
   for p in "${pairs[@]}"; do
     [[ "$QUIET" -eq 1 ]] || echo "    ${p%%	*}  →  ${p#*	}"
   done
-  ask_yn "Write $CONFIG_FILE serving these?" y || { info "config skipped"; return 0; }
+  local existing=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    existing="$CONFIG_FILE"
+    ask_yn "Rewrite the repos in $CONFIG_FILE to these (other keys kept, backup first)?" y \
+      || { info "config left alone"; return 0; }
+  else
+    ask_yn "Write $CONFIG_FILE serving these?" y || { info "config skipped"; return 0; }
+  fi
 
   mkdir -p "$CONFIG_DIR"
-  [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
+  local backup=""
+  if [[ -n "$existing" ]]; then
+    backup="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$CONFIG_FILE" "$backup" || die "could not back up $CONFIG_FILE" 1
+  fi
 
+  # Merge, not replace: every top-level key the operator set survives, only
+  # repos is refreshed. A path already in the config keeps the name the
+  # operator gave it, since the name is an alias and discovery only knows
+  # basenames. Entries that discovery no longer finds are dropped and named,
+  # so the loss is visible rather than silent — the backup has them.
   local socket="${XDG_RUNTIME_DIR:-/tmp}/beads_watch.sock"
-  printf '%s\n' "${pairs[@]}" | python3 -c '
+  local report
+  report=$(printf '%s\n' "${pairs[@]}" | python3 -c '
 import json, sys
+socket, dst, existing = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = {}
+if existing:
+    try:
+        with open(existing) as f:
+            cfg = json.load(f)
+    except ValueError as e:
+        sys.exit("%s is not valid JSON (%s); fix or remove it, then re-run" % (existing, e))
+    if not isinstance(cfg, dict):
+        sys.exit("%s is not a JSON object; fix or remove it, then re-run" % existing)
+old = {}
+for r in cfg.get("repos") or []:
+    if isinstance(r, dict) and r.get("path"):
+        old[r["path"]] = r.get("name") or ""
 repos = []
 for line in sys.stdin:
     line = line.rstrip("\n")
     if not line:
         continue
     name, _, path = line.partition("\t")
-    repos.append({"name": name, "path": path})
-json.dump({"socket": sys.argv[1], "repos": repos}, open(sys.argv[2], "w"), indent=2)
-open(sys.argv[2], "a").write("\n")
-' "$socket" "$CONFIG_FILE" || die 'could not write the config' 1
-  ok "wrote $CONFIG_FILE"
+    repos.append({"name": old.get(path) or name, "path": path})
+new = {r["path"] for r in repos}
+cfg.setdefault("socket", socket)
+cfg["repos"] = repos
+with open(dst, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+for path, name in old.items():
+    if path not in new:
+        print("dropped\t%s\t%s" % (name, path))
+for r in repos:
+    if r["path"] not in old:
+        print("added\t%s\t%s" % (r["name"], r["path"]))
+' "$socket" "$CONFIG_FILE" "$existing") || die 'could not write the config' 1
 
-  # Validate before anything tries to start against it.
-  if "$PREFIX/$BIN_NAME" --print-config >/dev/null 2>&1; then
+  if [[ -n "$existing" ]]; then
+    ok "rewrote repos in $CONFIG_FILE (backup: $backup)"
+    local kind name path
+    while IFS=$'\t' read -r kind name path; do
+      [[ -n "$kind" ]] || continue
+      case "$kind" in
+        dropped) warn "dropped $name → $path (not found by discovery; still in the backup)" ;;
+        added) info "added $name → $path" ;;
+      esac
+    done <<<"$report"
+  else
+    ok "wrote $CONFIG_FILE"
+  fi
+
+  # Validate before anything tries to start against it. A config can pass and
+  # still carry a repo the daemon will serve as unavailable; it says so on
+  # stderr, and that is worth seeing here rather than in the journal later.
+  local verdict line
+  if verdict=$("$PREFIX/$BIN_NAME" --print-config 2>&1 >/dev/null); then
     ok "config validates"
+    [[ -z "$verdict" ]] || while IFS= read -r line; do warn "$line"; done <<<"$verdict"
   else
     warn "config did not validate:"
-    "$PREFIX/$BIN_NAME" --print-config 2>&1 | head -5 >&2 || true
+    printf '%s\n' "$verdict" | head -5 >&2
   fi
 }
 
@@ -897,8 +983,8 @@ print_plan() {
   draw_box "0;36" \
     "\033[1mbeads_watch setup — dry run\033[0m" \
     "" \
-    "binary   → $PREFIX/$BIN_NAME" \
-    "config   → $([[ "$NO_CONFIG" -eq 1 ]] && echo 'skipped' || echo "$CONFIG_FILE")" \
+    "binary   → $PREFIX/$BIN_NAME$([[ "$FORCE" -eq 1 ]] && echo ' (--force: reinstall even if current)')" \
+    "config   → $(config_plan)" \
     "units    → $([[ "$NO_UNITS" -eq 1 ]] && echo 'skipped' || echo "$UNIT_DIR")" \
     "source   → $([[ "$REPO_MODE" -eq 1 && -z "$DIST_URL" ]] && echo "$HERE" || echo "${DIST_URL:-<none>}")" \
     "bridge   → $(tailnet_ip):$BRIDGE_PORT"

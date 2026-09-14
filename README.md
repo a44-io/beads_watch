@@ -328,6 +328,15 @@ with this box's own tailnet address, starts it, and health-checks all of it.
 and changes nothing; `--uninstall` reverses it and keeps every `.beads`. See
 [Releases](#releases) for what is being served and how it gets there.
 
+Re-running it is safe. An existing `config.json` is never touched, not by a
+plain re-run and not by `--force`, which only means "reinstall the binary
+even when the installed commit is current". To refresh the `repos` list from
+discovery (or from `--repo` flags) pass `--rewrite-config`: it keeps every
+other key (`notify`, `allow`, `br_path`, …), keeps the name you gave a repo
+that is still there, names each entry it drops, and leaves a timestamped
+`config.json.bak.<ts>` beside the file first. `--dry-run` says which of these
+a run would do.
+
 Needs `br` on `PATH`, plus tailscale for the bridge. It falls back to building
 from source when no prebuilt matches the box, which needs Go 1.24+.
 
