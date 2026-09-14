@@ -173,9 +173,17 @@ func (r *Resolver) lookup(ctx context.Context, addr string) (*Peer, error) {
 	}
 	// "tagged-devices" is the synthetic owner tailscale reports for tagged
 	// nodes. It names no human, so recording it as the actor would be a lie
-	// dressed as an identity.
-	if login := w.UserProfile.LoginName; login != "" && login != "tagged-devices" {
+	// dressed as an identity. Whois of a node's OWN address is the other
+	// case: there tailscale fills LoginName with the node's FQDN, which is
+	// not a person either, and would render the actor as "fqdn@node".
+	if login := w.UserProfile.LoginName; login != "" && login != "tagged-devices" && !sameNode(login, fqdn) {
 		peer.Login = login
 	}
 	return peer, nil
+}
+
+// sameNode reports whether a LoginName is just the node's own name in
+// disguise: equal to its FQDN, with or without the trailing dot.
+func sameNode(login, fqdn string) bool {
+	return fqdn != "" && strings.TrimSuffix(login, ".") == fqdn
 }
