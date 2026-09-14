@@ -14,6 +14,23 @@ second implementation of beads semantics to drift. A close initiated locally,
 over this daemon's HTTP surface, or by any other tool on the box lands in the
 same log and therefore in the same feed.
 
+## Not the doorbell
+
+The daemon also serves `GET /v1/events`, a server-sent-event stream that
+rings once per repo each time its JSONL export is rewritten (README, API).
+The two are for different clients and should not be confused:
+
+| | ntfy feed (this document) | `GET /v1/events` doorbell |
+|---|---|---|
+| Says | what happened: type, bead, actor, old and new value | that *something* changed in `<repo>` |
+| Transport | an ntfy broker, a topic, a token | the connection the client already holds to the daemon |
+| Delivery | at-least-once, cursor-driven, survives restarts | at-most-once, no cursor, no replay |
+| Meant for | agents, hooks, phones — anything that reacts to a bead | a client that will re-ask `br` for the truth, like omabeads' notifier |
+
+Both keep the no-second-implementation rule: neither decides what a change
+means. The feed replays br's own audit rows; the doorbell only says a file
+moved.
+
 ## The contract
 
 One firehose topic for the whole tailnet (default `beads-events`). Every node

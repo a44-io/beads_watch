@@ -240,6 +240,42 @@ sandbox cannot see it. The path is probed on every request, so a `git clone`
 that lands later starts answering with no restart, and a checkout that
 disappears is refused rather than handed to `br` to fail on `chdir`.
 
+### `GET /v1/events`
+
+A doorbell. Server-sent events, one per served repo each time its JSONL
+export is rewritten, saying "something changed in `<repo>`, go ask `br`"
+and nothing else:
+
+```console
+$ curl -sN https://beads-arch.dev.a44.io/v1/events
+: connected
+
+event: change
+data: {"repo":"beads_watch","ts":"2026-09-14T21:43:19.419943554Z"}
+
+: ping
+```
+
+`repo` is the name exactly as `/v1/repos` lists it; `ts` is when the daemon
+noticed, RFC 3339. `?repo=a,b` restricts the stream to those repos; a name
+this node does not serve is a 404 envelope. A `: ping` comment every 30s
+keeps idle proxies from dropping the connection, and the handler never runs
+`br`, so a stream can stay open indefinitely.
+
+What it watches is the point. A read-only `br list` opens the database's
+WAL and lock files for writing and would ring anything watching `.beads/`
+— including the daemon's own `/br` handler serving the very client that is
+listening. Only the JSONL export moves when `br` mutated something, so the
+bell is a fingerprint (size and mtime) of that one file, stat'd once a
+second and debounced so a multi-file export rings once. A `br list`, through
+the daemon or in a shell, rings nothing.
+
+There is no cursor and no replay: a client that reconnects re-asks `br`
+once and is current. For typed per-bead events with delivery guarantees,
+use the ntfy feed in [Events](#events); this is the transport-local signal
+for a client that already holds a connection and will ask `br` for the
+truth.
+
 ## Identity
 
 `BD_ACTOR` is set per request from what the transport says about the caller,

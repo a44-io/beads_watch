@@ -159,6 +159,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The doorbell behind GET /v1/events: on for every served repo, with or
+	// without a notify block, since it has no broker to configure.
+	handler.Start(ctx)
+
 	if cfg.Notify != nil {
 		watched := cfg.NotifyRepos()
 		if _, err := events.Start(ctx, log, cfg.Notify, watched, cfg.BrPath); err != nil {

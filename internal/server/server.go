@@ -52,9 +52,11 @@ type Server struct {
 	allow    map[string]bool
 	log      *slog.Logger
 	node     string
+	bell     *doorbell
 }
 
-// New builds a Server from a normalized Config.
+// New builds a Server from a normalized Config. It starts nothing; Start
+// begins the background watchers.
 func New(cfg *Config, log *slog.Logger) *Server {
 	allow := make(map[string]bool, len(cfg.Allow))
 	for _, c := range cfg.Allow {
@@ -64,17 +66,25 @@ func New(cfg *Config, log *slog.Logger) *Server {
 	if err != nil {
 		node = "unknown"
 	}
+	runner := &brexec.Runner{
+		Path:      cfg.BrPath,
+		MaxOutput: cfg.MaxOutputBytes,
+	}
 	return &Server{
-		cfg: cfg,
-		runner: &brexec.Runner{
-			Path:      cfg.BrPath,
-			MaxOutput: cfg.MaxOutputBytes,
-		},
+		cfg:      cfg,
+		runner:   runner,
 		resolver: &tsidentity.Resolver{},
 		allow:    allow,
 		log:      log,
 		node:     node,
+		bell:     newDoorbell(cfg, runner, log),
 	}
+}
+
+// Start begins the per-repo watchers behind GET /v1/events. They stop when
+// ctx does.
+func (s *Server) Start(ctx context.Context) {
+	s.bell.start(ctx)
 }
 
 // Handler returns the daemon's routes.
@@ -83,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/whoami", s.handleWhoami)
 	mux.HandleFunc("GET /v1/repos", s.handleRepos)
+	mux.HandleFunc("GET /v1/events", s.handleEvents)
 	mux.HandleFunc("POST /v1/repos/{repo}/br", s.handleBr)
 	mux.HandleFunc("/", s.handleNotFound)
 	return s.withCommonHeaders(mux)
@@ -474,7 +485,7 @@ func (s *Server) handleBr(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "NO_SUCH_ROUTE",
 		fmt.Sprintf("No route for %s %s.", r.Method, r.URL.Path),
-		"Routes: GET /v1/health, GET /v1/whoami, GET /v1/repos, POST /v1/repos/{repo}/br")
+		"Routes: GET /v1/health, GET /v1/whoami, GET /v1/repos, GET /v1/events, POST /v1/repos/{repo}/br")
 }
 
 // maxActorLen bounds a self-asserted actor. Real names are far shorter.
