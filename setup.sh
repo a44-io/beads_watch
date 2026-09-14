@@ -728,6 +728,131 @@ node_name() {
   printf '%s' "$n" | tr '[:upper:]' '[:lower:]'
 }
 
+# The unit files, rendered to stdout. Writing goes through here and so does
+# the dry-run plan, so what the plan diffs is byte-for-byte what a run writes.
+render_unit() { # render_unit NAME TAILNET_IP
+  local unit="$1" ip="${2:-}"
+  case "$unit" in
+    "$SERVICE_UNIT")
+      cat <<UNIT
+[Unit]
+Description=beads_watch — serve br over the tailnet
+Documentation=https://github.com/a44-io/beads_watch
+After=network-online.target
+
+# A config the daemon refuses (a typo'd key, every repo path missing) exits 1
+# before the socket binds. Restart= below retries that; without a cap it would
+# retry every 2s forever in "activating (auto-restart)", which never reaches
+# "failed" and so never shows in systemctl --failed. Five tries in a minute
+# still rides out a transient, then the unit fails loudly instead.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=$PREFIX/$BIN_NAME
+Restart=on-failure
+RestartSec=2s
+
+# The daemon scrubs these from br's environment anyway, but a service file that
+# cannot introduce them is one less way to end up serving the wrong workspace.
+UnsetEnvironment=BEADS_DIR BD_DB BD_DATABASE BD_ACTOR BR_OUTPUT_FORMAT TOON_DEFAULT_FORMAT
+Environment=RUST_LOG=error
+
+# br needs to read and write .beads/ across the home directory, so home is
+# deliberately left open (ProtectHome=no is the default, spelled out so the
+# choice is visible); the rest is tightened.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=no
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target
+UNIT
+      ;;
+    "$PROXY_SOCKET")
+      cat <<UNIT
+[Unit]
+Description=beads_watch TCP bridge — tailnet :$BRIDGE_PORT → unix socket
+Documentation=https://github.com/a44-io/beads_watch
+
+[Socket]
+# Bind only the tailscale IP: tailnet peers (i.e. caddy on pi) can reach it,
+# the LAN cannot. FreeBind lets the socket exist before tailscaled brings the
+# address up at login.
+ListenStream=$ip:$BRIDGE_PORT
+FreeBind=true
+
+[Install]
+WantedBy=sockets.target
+UNIT
+      ;;
+    "$PROXY_SERVICE")
+      cat <<UNIT
+[Unit]
+Description=beads_watch TCP bridge — proxy to the unix socket
+Documentation=https://github.com/a44-io/beads_watch
+Requires=$SERVICE_UNIT
+After=$SERVICE_UNIT
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd %t/beads_watch.sock
+PrivateTmp=true
+NoNewPrivileges=true
+UNIT
+      ;;
+    *) die "render_unit: unknown unit $unit" 1 ;;
+  esac
+}
+
+# Fingerprint the installed units, so a re-run that changes nothing does not
+# restart a healthy daemon for no reason.
+units_fingerprint() {
+  local u out=""
+  for u in "$SERVICE_UNIT" "$PROXY_SOCKET" "$PROXY_SERVICE"; do
+    out+="$(cat "$UNIT_DIR/$u" 2>/dev/null || true)"
+  done
+  printf '%s' "$out" | cksum
+}
+
+# What this run would do to the units, in one line, for the dry-run plan: each
+# unit that would be written differently from what is installed is named, and
+# so is the restart that follows, since that is the question an operator asks
+# before re-running on a box that is serving.
+units_plan() {
+  if [[ "$NO_UNITS" -eq 1 ]]; then echo "skipped (--no-units)"; return 0; fi
+  if [[ "$OS" != linux ]]; then echo "skipped (systemd units are linux-only)"; return 0; fi
+  if ! systemd_user_available; then echo "skipped (no systemd user session)"; return 0; fi
+
+  local ip u pending=()
+  ip=$(tailnet_ip)
+  local units=("$SERVICE_UNIT")
+  [[ -n "$ip" ]] && units+=("$PROXY_SOCKET" "$PROXY_SERVICE")
+  for u in "${units[@]}"; do
+    if [[ ! -e "$UNIT_DIR/$u" ]]; then
+      pending+=("$u (new)")
+    elif ! diff -q <(render_unit "$u" "$ip") "$UNIT_DIR/$u" >/dev/null 2>&1; then
+      pending+=("$u (changed)")
+    fi
+  done
+  if [[ ${#pending[@]} -eq 0 ]]; then
+    echo "$UNIT_DIR (all current)"
+    return 0
+  fi
+  local restart=""
+  if [[ "$NO_START" -eq 0 ]] && systemctl --user is-active --quiet "$SERVICE_UNIT" 2>/dev/null; then
+    restart="; daemon restarts"
+  fi
+  echo "$UNIT_DIR (write: $(IFS=,; echo "${pending[*]}" | sed 's/,/, /g')$restart)"
+}
+
 setup_units() {
   [[ "$NO_UNITS" -eq 1 ]] && { info "units skipped (--no-units)"; return 0; }
   phase "Units"
@@ -751,15 +876,6 @@ setup_units() {
 
   mkdir -p "$UNIT_DIR"
 
-  # Fingerprint the units before touching them, so a re-run that changes
-  # nothing does not restart a healthy daemon for no reason.
-  units_fingerprint() {
-    local u out=""
-    for u in "$SERVICE_UNIT" "$PROXY_SOCKET" "$PROXY_SERVICE"; do
-      out+="$(cat "$UNIT_DIR/$u" 2>/dev/null || true)"
-    done
-    printf '%s' "$out" | cksum
-  }
   local before after
   before=$(units_fingerprint)
 
@@ -788,70 +904,12 @@ setup_units() {
     fi
   done
 
-  cat >"$UNIT_DIR/$SERVICE_UNIT" <<UNIT
-[Unit]
-Description=beads_watch — serve br over the tailnet
-Documentation=https://github.com/a44-io/beads_watch
-After=network-online.target
-
-[Service]
-Type=exec
-ExecStart=$PREFIX/$BIN_NAME
-Restart=on-failure
-RestartSec=2s
-
-# The daemon scrubs these from br's environment anyway, but a service file that
-# cannot introduce them is one less way to end up serving the wrong workspace.
-UnsetEnvironment=BEADS_DIR BD_DB BD_DATABASE BD_ACTOR BR_OUTPUT_FORMAT TOON_DEFAULT_FORMAT
-Environment=RUST_LOG=error
-
-# br needs to read and write .beads/ across the home directory, so the
-# filesystem stays writable; the rest is tightened.
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-write
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-RestrictNamespaces=true
-LockPersonality=true
-
-[Install]
-WantedBy=default.target
-UNIT
+  render_unit "$SERVICE_UNIT" "$ip" >"$UNIT_DIR/$SERVICE_UNIT"
   ok "wrote $UNIT_DIR/$SERVICE_UNIT"
 
   if [[ -n "$ip" ]]; then
-    cat >"$UNIT_DIR/$PROXY_SOCKET" <<UNIT
-[Unit]
-Description=beads_watch TCP bridge — tailnet :$BRIDGE_PORT → unix socket
-Documentation=https://github.com/a44-io/beads_watch
-
-[Socket]
-# Bind only the tailscale IP: tailnet peers (i.e. caddy on pi) can reach it,
-# the LAN cannot. FreeBind lets the socket exist before tailscaled brings the
-# address up at login.
-ListenStream=$ip:$BRIDGE_PORT
-FreeBind=true
-
-[Install]
-WantedBy=sockets.target
-UNIT
-
-    cat >"$UNIT_DIR/$PROXY_SERVICE" <<UNIT
-[Unit]
-Description=beads_watch TCP bridge — proxy to the unix socket
-Documentation=https://github.com/a44-io/beads_watch
-Requires=$SERVICE_UNIT
-After=$SERVICE_UNIT
-
-[Service]
-ExecStart=/usr/lib/systemd/systemd-socket-proxyd %t/beads_watch.sock
-PrivateTmp=true
-NoNewPrivileges=true
-UNIT
+    render_unit "$PROXY_SOCKET" "$ip" >"$UNIT_DIR/$PROXY_SOCKET"
+    render_unit "$PROXY_SERVICE" "$ip" >"$UNIT_DIR/$PROXY_SERVICE"
     ok "wrote the bridge units ($ip:$BRIDGE_PORT)"
   fi
 
@@ -888,6 +946,11 @@ UNIT
   if [[ "$restarting" -eq 1 && -n "$ip" ]]; then
     systemctl --user stop "$PROXY_SOCKET" "$PROXY_SERVICE" &>/dev/null || true
   fi
+
+  # A unit that hit its start limit stays "failed" and refuses a plain start
+  # until the interval passes. What is installed now is not what failed, so
+  # clear the counter first; on a healthy unit this is a no-op.
+  systemctl --user reset-failed "$SERVICE_UNIT" &>/dev/null || true
 
   if [[ "$restarting" -eq 1 ]]; then
     systemctl --user restart "$SERVICE_UNIT" ||
@@ -985,7 +1048,7 @@ print_plan() {
     "" \
     "binary   → $PREFIX/$BIN_NAME$([[ "$FORCE" -eq 1 ]] && echo ' (--force: reinstall even if current)')" \
     "config   → $(config_plan)" \
-    "units    → $([[ "$NO_UNITS" -eq 1 ]] && echo 'skipped' || echo "$UNIT_DIR")" \
+    "units    → $(units_plan)" \
     "source   → $([[ "$REPO_MODE" -eq 1 && -z "$DIST_URL" ]] && echo "$HERE" || echo "${DIST_URL:-<none>}")" \
     "bridge   → $(tailnet_ip):$BRIDGE_PORT"
 }

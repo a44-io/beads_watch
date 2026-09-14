@@ -534,13 +534,22 @@ instead of silently doing nothing.
 
 ### HTTP 502 with an empty body
 
-The bridge is up and the daemon is not. Check it, and note that a crash-looping
-unit reports `activating (auto-restart)` rather than `failed`, so it does not
-show up in `systemctl --failed`:
+The bridge is up and the daemon is not. A daemon that cannot start (a
+config it refuses) is retried five times in a minute and then left `failed`,
+which is the state that shows up in `--failed`; a unit still inside those
+retries reports `activating (auto-restart)` for a few seconds first:
 
 ```bash
+systemctl --user --failed
 systemctl --user status beads_watch
 journalctl --user -u beads_watch -n 50
+```
+
+After fixing the cause, clear the start-limit counter before starting it
+again, or systemd refuses the start until the minute is up:
+
+```bash
+systemctl --user reset-failed beads_watch && systemctl --user start beads_watch
 ```
 
 ### `repo path unusable, serving it as unavailable` in the journal
@@ -569,7 +578,8 @@ Every configured path failed. That is a config error, not drift, and the
 daemon refuses rather than coming up to serve nothing. The message lists each
 repo with its own reason. Also expect this when the unit's sandbox hides
 *all* of them, for instance every repo under a directory the service cannot
-see.
+see. Fix the config, then `systemctl --user reset-failed beads_watch &&
+systemctl --user start beads_watch`.
 
 ### `json: unknown field "..."` at startup
 
@@ -614,11 +624,6 @@ to check.
 
 ## Limitations
 
-- **A genuine config error still restarts forever.** A missing repo path no
-  longer stops the daemon, but a real config mistake (a typo'd key, every
-  path missing) still exits non-zero and the unit's `Restart=on-failure`
-  retries it every 2s indefinitely, showing as `activating (auto-restart)`
-  rather than `failed`. Tracked in beads.
 - **Forwarded identity is trusted from any peer.** A caller that reaches the
   bridge port directly, skipping caddy, can set `Tailscale-User-Login` or
   `X-Forwarded-For` and mint a verified actor. `systemd-socket-proxyd` erases
