@@ -397,15 +397,18 @@ curl -fsSL https://github.com/a44-io/beads_watch/releases/latest/download/setup.
 ```
 
 That installs a prebuilt binary matching the release's commit, verified by
-sha256 against the release's own `SHA256SUMS` and `manifest.json`, discovers
+sha256 against the release's own `SHA256SUMS` and `manifest.json` and, when
+`cosign` is on the box, by the Sigstore signature the release workflow put
+beside each asset (see [Releases](#releases)), discovers
 the `.beads` workspaces on the box, writes the config with this box's own
 tailnet address as `listen` and the proxy box (`--proxy-host <name>`,
 resolved with `tailscale ip`, or `--trusted-proxy <ip>` to skip the lookup)
 as `trusted_proxies`, generates the systemd unit, starts it, and
 health-checks all of it. Flags go after `bash -s --`: `--yes` takes every
 default for an unattended run; `--version v1.2.0` installs that release
-instead of the latest; `--dry-run` prints the plan and changes nothing;
-`--uninstall` reverses it and keeps every `.beads`. See
+instead of the latest; `--require-signature` refuses to install anything
+whose signature it cannot verify; `--dry-run` prints the plan and changes
+nothing; `--uninstall` reverses it and keeps every `.beads`. See
 [Releases](#releases) for what a release contains and how it is cut.
 
 Re-running it is safe. An existing `config.json` is never rewritten, not by
@@ -429,16 +432,6 @@ From a clone instead, which downloads nothing:
 
 ```bash
 git clone https://github.com/a44-io/beads_watch.git && cd beads_watch && ./setup.sh
-```
-
-From a private fileserver, for a fleet that publishes its own builds with
-`scripts/publish-dist.sh` (see [Private fleet](#private-fleet)). The served
-copy of `setup.sh` has its URL stamped in; a hand-downloaded copy needs
-telling, and a plain directory works the same way for an offline install:
-
-```bash
-curl -fsSL https://dist.example.com/setup.sh | BW_DIST_URL=https://dist.example.com bash
-./setup.sh --dist-url /mnt/dist
 ```
 
 Or by hand, if you would rather wire it up yourself:
@@ -520,40 +513,58 @@ Each one is a tag, and carries a flat set of assets:
 | `beads_watch-linux-amd64.tar.gz`, `beads_watch-linux-arm64.tar.gz` | prebuilt, `CGO_ENABLED=0`. Static, so it does not carry the publishing box's glibc to a consumer |
 | `SHA256SUMS` | `sha256sum` format, covering every other asset |
 | `manifest.json` | commit, tag, version, and sha256 for everything above; what `setup.sh` reads |
+| `<asset>.sigstore.json` | one Sigstore bundle per asset above: the signature, the certificate that names who signed, and the transparency-log entry, in one file |
 
 There is no git bundle on a release: the repo itself is the source, and
 `setup.sh` clones it at the release's tag when it has to build.
 
-To verify by hand, download the assets and check them the usual way:
+Two checks apply, and they answer different questions. `sha256sum` answers
+whether the bytes you have are the bytes that were uploaded:
 
 ```bash
 sha256sum -c SHA256SUMS
 ```
 
-`setup.sh` does the same check, against `manifest.json` and against
-`SHA256SUMS`, and exits 3 with nothing installed when either disagrees.
-Both files ride on the same release as the tarballs, so this is an integrity
-check and says nothing about who uploaded them; there is no Sigstore
-signature yet, because releases are cut from an operator's box rather than a
-CI workflow with an identity worth binding one to.
-
-A release is cut from a clean checkout, and lands as a **draft**:
+The signature answers who uploaded them. Every release is built by
+[`release.yml`](.github/workflows/release.yml), and that workflow signs each
+asset with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+using its own identity: no long-lived key anywhere, a certificate minted for
+the run that names this repository's workflow file at this tag, and a public
+transparency-log entry recording the signing. Swapping a tarball on the
+release page, even together with its line in `SHA256SUMS`, cannot produce a
+bundle that passes this, because nothing outside that workflow run can mint
+that certificate:
 
 ```bash
-scripts/publish-dist.sh --tag v1.2.0 --release
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/a44-io/beads_watch/\.github/workflows/release\.yml@refs/tags/v[0-9]' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
 ```
 
-That tags `HEAD`, cross-compiles, writes the asset set above into
-`dist/release/`, and creates the draft with `gh`. Nothing is public until
-someone reads the draft on GitHub and presses Publish, and a draft creates no
-tag on the remote, so an unpublished one leaves no trace. `--push-tag` pushes
-the tag first, which pins the release to it. The default targets are
-`linux/amd64,linux/arm64`; `--targets` takes any GOOS/GOARCH list.
+`setup.sh` runs both checks. The sha256 pair is always checked, against
+`manifest.json` and against `SHA256SUMS`, and a mismatch is exit 3 with
+nothing installed. When `cosign` is on the box it then verifies
+`manifest.json` and the tarball it is about to install against the identity
+above, and a bundle that does not verify is exit 3 as well. Without `cosign`,
+or on a release that carries no bundles, it says so and sha256 decides;
+`--require-signature` turns both of those into a refusal.
 
-The script refuses to publish from a dirty tree, because what it builds is
-`HEAD` and uncommitted changes would be left out of what gets served with
-nothing to flag it. `--allow-dirty` overrides that and marks `"dirty": true`
-in the manifest, which `setup.sh` warns about on the way in.
+A release is a tag. Push one and the workflow does the rest:
+
+```bash
+git tag -a v1.2.0 -m 'beads_watch v1.2.0'
+git push origin v1.2.0
+```
+
+It cross-compiles for `linux/amd64` and `linux/arm64`, writes the asset set
+above, signs it, and opens the release as a **draft**. Nothing is public
+until someone reads the draft on GitHub and presses Publish. The workflow is
+`scripts/publish-dist.sh --tag v1.2.0 --release --sign` with the right
+identity; the same script run by hand produces an unsigned draft, which the
+release notes and `setup.sh` both call out, and it refuses a dirty tree,
+because what it builds is `HEAD` and uncommitted changes would be left out
+of what gets served with nothing to flag it.
 
 A published binary reports the commit it was built from, which is what makes
 the release traceable:
@@ -569,26 +580,6 @@ built:  2026-09-09T13:17:48Z
 also the `commit` in the release's `manifest.json`. `GET /v1/health` grows a
 `commit` field on a published binary too. A source build reports neither,
 since unstamped code cannot say which commit it is.
-
-### Private fleet
-
-The same script publishes to a private fileserver, for a fleet that wants
-its builds off GitHub or wants to serve a commit that is not a release. It
-builds a directory with `setup.sh` (URL-stamped), a `git bundle` of the
-branch so a consumer's source build can still stamp its own commit,
-`bin/beads_watch-<os>-<arch>.tar.gz`, and `manifest.json`, then rsyncs it:
-
-```bash
-scripts/publish-dist.sh --url https://dist.example.com --push host:/srv/dist/
-```
-
-Both channels combine in one run (`--tag v1.2.0 --release --url … --push …`).
-Consumers install with the fileserver form from [Install](#install), and can
-read what is being served without installing it:
-
-```bash
-curl -s https://dist.example.com/manifest.json | jq '{commit, tag, generated_at}'
-```
 
 ## CLI
 

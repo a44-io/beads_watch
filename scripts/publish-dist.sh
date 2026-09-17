@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Build the distribution that setup.sh consumes, and publish it: as a draft
 # GitHub Release (the public channel), to a private fileserver over rsync (a
-# fleet's own channel), or both from one run. An operator action, not a CI
-# gate.
+# fleet's own channel), or both from one run.
+#
+# The public channel is normally driven by .github/workflows/release.yml, which
+# runs this script with --release --sign on a version tag push. Run that way,
+# every asset gets a Sigstore bundle bound to the workflow's identity, which is
+# what setup.sh verifies. Run by hand, --release still works and produces an
+# unsigned draft; setup.sh installs from one, but says so.
 #
 #   scripts/publish-dist.sh                        # build ./dist/ only
 #   scripts/publish-dist.sh --tag v1.2.0 --release
@@ -10,6 +15,10 @@
 #                                                  # asset set as a DRAFT release
 #                                                  # on github.com/a44-io/beads_watch;
 #                                                  # publish it from the GitHub UI
+#   scripts/publish-dist.sh --tag v1.2.0 --release --sign
+#                                                  # …signing each asset with
+#                                                  # cosign first (what the
+#                                                  # workflow runs)
 #   scripts/publish-dist.sh --url https://dist.example.com
 #                                                  # …and stamp that URL into the
 #                                                  # served setup.sh, so a bare
@@ -35,6 +44,12 @@
 #                    <out>/release/ and create a DRAFT release for --tag on
 #                    a44-io/beads_watch with gh. Needs --tag vX.Y.Z. Always a
 #                    draft: nothing is public until a human publishes it.
+#   --sign           sign every release asset with cosign (keyless) and upload
+#                    the .sigstore.json bundles beside them. Needs --release
+#                    and cosign on PATH. Inside the release workflow the
+#                    identity is the workflow itself, which is the only one
+#                    setup.sh accepts; a signature from a browser login is a
+#                    real signature under an identity setup.sh refuses.
 #   --targets LIST   comma-separated GOOS/GOARCH pairs
 #                    (default: linux/amd64,linux/arm64)
 #   --no-binary      skip prebuilt binaries entirely (consumers build from source)
@@ -59,6 +74,9 @@
 #   manifest.json                     the same schema; binaries[].file are the
 #                                     flat names and bundle is null. No git
 #                                     bundle: the public repo is the clone source.
+#   <asset>.sigstore.json             with --sign: one cosign bundle per asset
+#                                     above (certificate, signature, and the
+#                                     transparency-log entry in one file)
 #   A copy of the set is left in <out>/release/.
 #
 # Exit codes: 0 published · 1 a step failed · 2 misuse.
@@ -75,6 +93,7 @@ PUSH=""
 TAG=""
 PUSH_TAG=0
 RELEASE=0
+SIGN=0
 TARGETS="linux/amd64,linux/arm64"
 WITH_BINARY=1
 ALLOW_DIRTY=0
@@ -84,6 +103,13 @@ ALLOW_DIRTY=0
 # $RELEASE_BASE/latest/download/<asset>; setup.sh derives both.
 RELEASE_REPO="a44-io/beads_watch"
 RELEASE_BASE="https://github.com/$RELEASE_REPO/releases"
+
+# The identity a --sign run inside the release workflow signs under, as it
+# appears in the certificate: this workflow file, in this repo, at a version
+# tag. setup.sh carries the same pair and verifies against it; the two must
+# move together.
+SIGN_IDENTITY_RE='^https://github\.com/a44-io/beads_watch/\.github/workflows/release\.yml@refs/tags/v[0-9]'
+SIGN_ISSUER='https://token.actions.githubusercontent.com'
 
 die() {
   printf 'publish-dist: %s\n' "$1" >&2
@@ -98,6 +124,7 @@ while [[ $# -gt 0 ]]; do
     --tag) [[ -n "${2:-}" ]] || die '--tag needs a name' 2; TAG="$2"; shift 2 ;;
     --push-tag) PUSH_TAG=1; shift ;;
     --release) RELEASE=1; shift ;;
+    --sign) SIGN=1; shift ;;
     --targets) [[ -n "${2:-}" ]] || die '--targets needs a list' 2; TARGETS="$2"; shift 2 ;;
     --no-binary) WITH_BINARY=0; shift ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
@@ -116,6 +143,7 @@ if [[ "$RELEASE" -eq 1 ]]; then
     die "--release wants a vX.Y.Z tag, got '$TAG'" 2
   [[ "$WITH_BINARY" -eq 1 ]] || die '--release without prebuilt binaries makes no sense (drop --no-binary)' 2
 fi
+[[ "$SIGN" -eq 1 && "$RELEASE" -eq 0 ]] && die '--sign needs --release (only release assets are signed)' 2
 
 command -v git >/dev/null || die 'git is required'
 command -v python3 >/dev/null || die 'python3 is required (writes manifest.json)'
@@ -125,6 +153,7 @@ if [[ "$RELEASE" -eq 1 ]]; then
   gh auth status >/dev/null 2>&1 || die 'gh is not authenticated; run gh auth login (the a44-io account)'
   command -v sha256sum >/dev/null || command -v shasum >/dev/null || die 'sha256sum or shasum is required for --release (writes SHA256SUMS)'
 fi
+[[ "$SIGN" -eq 1 ]] && { command -v cosign >/dev/null || die 'cosign is required for --sign (https://docs.sigstore.dev/cosign/system_config/installation/)'; }
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -140,7 +169,12 @@ if [[ -n "$STATUS" && "$ALLOW_DIRTY" -eq 0 ]]; then
   die "working tree is dirty. The bundle serves HEAD ($COMMIT), not these changes.
   Commit them, or pass --allow-dirty to publish HEAD anyway." 1
 fi
-BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+# A tag checkout (the release workflow's) is a detached HEAD, which
+# --abbrev-ref names "HEAD"; the manifest should say which branch carries the
+# commit, so fall back to the first remote branch that does.
+BRANCH=$(git -C "$REPO" symbolic-ref -q --short HEAD ||
+  git -C "$REPO" branch -r --contains HEAD --format='%(refname:short)' 2>/dev/null | sed 's#^origin/##' | grep -v '^HEAD$' | head -1)
+BRANCH=${BRANCH:-detached}
 [[ "$BRANCH" == main ]] || echo "publish-dist: NOTE publishing branch '$BRANCH', not main" >&2
 
 # ── 0. Tag ──────────────────────────────────────────────────────────────────
@@ -317,6 +351,43 @@ if [[ "$RELEASE" -eq 1 ]]; then
     echo "publish-dist: NOTE tag $TAG does not match const Version \"$VERSION\" in internal/server/server.go" >&2
 fi
 
+# ── 5b. Signatures ──────────────────────────────────────────────────────────
+# One bundle per asset, SHA256SUMS and manifest.json included, so the sums a
+# user checks by hand are themselves signed. Keyless: cosign trades an OIDC
+# token for a minutes-long certificate, signs, and records both in the public
+# transparency log; the bundle carries certificate, signature, and log entry
+# together, so verification needs nothing but the bundle and the file. In the
+# release workflow the token is the job's own (id-token: write) and the
+# certificate names the workflow file at the tag. Outside it, cosign opens a
+# browser login, and the certificate names whoever logged in: a valid
+# signature under an identity setup.sh does not trust. Say so instead of
+# leaving it to be discovered at install time.
+SIGNED=()
+if [[ "$SIGN" -eq 1 ]]; then
+  if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+    echo "publish-dist: NOTE not inside GitHub Actions; the signing identity will be your login, which" >&2
+    echo "publish-dist:      setup.sh refuses (it trusts only $SIGN_IDENTITY_RE). Fine for a local check." >&2
+  fi
+  for asset in "${REL_ASSETS[@]}"; do
+    echo "publish-dist: signing $asset"
+    (cd "$REL_DIR" && cosign sign-blob --yes --bundle "$asset.sigstore.json" "$asset" >/dev/null) ||
+      die "cosign sign-blob failed for $asset"
+    SIGNED+=("$asset.sigstore.json")
+  done
+  # Verify what was just signed, the way setup.sh will, before uploading it.
+  # Outside the workflow the identity check is expected to fail, so it is only
+  # a hard gate where the identity can be right.
+  if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+    for asset in "${REL_ASSETS[@]}"; do
+      (cd "$REL_DIR" && cosign verify-blob --bundle "$asset.sigstore.json" \
+        --certificate-identity-regexp "$SIGN_IDENTITY_RE" \
+        --certificate-oidc-issuer "$SIGN_ISSUER" "$asset" >/dev/null 2>&1) ||
+        die "freshly signed $asset does not verify against $SIGN_IDENTITY_RE; is this the release workflow on a v* tag?"
+    done
+    echo "publish-dist: ${#SIGNED[@]} bundles verify against the release workflow identity"
+  fi
+fi
+
 # ── 6. Push ─────────────────────────────────────────────────────────────────
 if [[ -n "$PUSH" ]]; then
   command -v rsync >/dev/null || die 'rsync is required for --push'
@@ -357,6 +428,22 @@ if [[ "$RELEASE" -eq 1 ]]; then
     echo '```bash'
     echo "sha256sum -c SHA256SUMS"
     echo '```'
+    if [[ "$SIGN" -eq 1 ]]; then
+      echo ""
+      echo "Every asset has a Sigstore bundle beside it, signed by this repository's release workflow at this tag. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/):"
+      echo ""
+      echo '```bash'
+      echo "cosign verify-blob --bundle SHA256SUMS.sigstore.json \\"
+      echo "  --certificate-identity-regexp '$SIGN_IDENTITY_RE' \\"
+      echo "  --certificate-oidc-issuer $SIGN_ISSUER \\"
+      echo "  SHA256SUMS"
+      echo '```'
+      echo ""
+      echo "\`setup.sh\` runs the same check on \`manifest.json\` and the tarball it installs when cosign is on the box."
+    else
+      echo ""
+      echo "This release was cut by hand and carries no Sigstore bundles; \`setup.sh\` installs from it on sha256 alone and says so."
+    fi
     if [[ -n "$PREV" ]]; then
       echo ""
       echo "## Changes since $PREV"
@@ -375,7 +462,7 @@ if [[ "$RELEASE" -eq 1 ]]; then
 
   echo "publish-dist: creating DRAFT release $TAG on $RELEASE_REPO"
   RELEASE_URL=$(cd "$REL_DIR" && gh release create "$TAG" --repo "$RELEASE_REPO" --draft \
-    --title "$TAG" --notes-file "$NOTES" "${TARGET_ARGS[@]}" "${REL_ASSETS[@]}") ||
+    --title "$TAG" --notes-file "$NOTES" "${TARGET_ARGS[@]}" "${REL_ASSETS[@]}" "${SIGNED[@]}") ||
     die 'gh release create failed'
   rm -f "$NOTES"
 fi
@@ -384,6 +471,12 @@ echo ""
 echo "✓ published ${COMMIT:0:12}${TAG:+ ($TAG)} to $OUT"
 if [[ "$RELEASE" -eq 1 ]]; then
   echo "  DRAFT release: $RELEASE_URL"
+  if [[ "$SIGN" -eq 1 ]]; then
+    echo "  signed: ${#SIGNED[@]} Sigstore bundles uploaded beside the assets"
+  else
+    echo "  UNSIGNED: no Sigstore bundles; setup.sh will install from it on sha256 alone and say so."
+    echo "  Signed releases come from .github/workflows/release.yml: push the tag and let it build."
+  fi
   echo "  review it there and press Publish; once it is public, consumers run:"
   echo "    curl -fsSL $RELEASE_BASE/latest/download/setup.sh | bash"
 fi

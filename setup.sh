@@ -43,7 +43,13 @@
 #   --no-config       do not create or touch ~/.config/beads_watch/config.json
 #   --no-units        do not install the systemd user units
 #   --no-start        install the units but do not start them
-#   --no-verify       skip sha256 verification of downloaded artifacts
+#   --no-verify       skip sha256 and signature verification of downloaded
+#                     artifacts
+#   --require-signature
+#                     refuse to install unless the release's Sigstore bundles
+#                     verify; without it, no cosign on the box or an unsigned
+#                     release is a warning and sha256 alone decides. Also
+#                     BW_REQUIRE_SIGNATURE=1
 #   --port PORT       tailnet port the daemon listens on (default: 8438)
 #   --proxy-host NAME the box running the reverse proxy; its forwarded identity
 #                     headers are trusted. A MagicDNS name or an ssh alias
@@ -57,16 +63,21 @@
 #   --help, -h        this text
 #
 # Exit codes: 0 success · 1 a step failed · 2 misuse (bad flag) · 3 infrastructure
-# (missing required tool, unreachable dist server, checksum mismatch).
+# (missing required tool, unreachable dist server, checksum or signature
+# mismatch).
 #
-# On signatures: every download is checked by sha256 against manifest.json,
+# On verification: every download is checked by sha256 against manifest.json,
 # and against SHA256SUMS too when the dist carries one (a GitHub Release
 # does), so `sha256sum -c SHA256SUMS` by hand agrees with what this script
-# checked. Both files ride on the same release as the tarballs, so this is an
-# integrity check, and it says nothing about who uploaded them. There is no
-# Sigstore bundle yet, because releases are cut by an operator's box rather
-# than a CI workflow with an identity worth binding a signature to; that
-# pipeline is a tracked follow-up. --no-verify skips the checks.
+# checked. That is integrity: the bytes that arrived are the bytes that were
+# uploaded. Who uploaded them is a second question, and a release cut by
+# .github/workflows/release.yml answers it: every asset has a Sigstore bundle
+# beside it, signed keyless under the workflow's own identity, so when cosign
+# is on this box the manifest and the tarball are verified against that
+# identity before anything is installed, and a mismatch is exit 3. Without
+# cosign, or for a release cut by hand (which carries no bundles), the script
+# says so and sha256 decides; --require-signature turns either into a refusal.
+# --no-verify skips all of it.
 
 set -euo pipefail
 umask 022
@@ -81,6 +92,13 @@ DEFAULT_DIST_URL=""
 # The public channel, when nothing above or on the command line says otherwise.
 RELEASE_REPO="a44-io/beads_watch"
 RELEASE_BASE="https://github.com/$RELEASE_REPO/releases"
+
+# The only signing identity a release's Sigstore bundles may carry: the
+# release workflow in this repo, run from a version tag. A personal login, a
+# fork's copy of the workflow, or a run from a branch all fail this check, on
+# purpose. scripts/publish-dist.sh carries the same pair; they move together.
+SIGN_IDENTITY_RE='^https://github\.com/a44-io/beads_watch/\.github/workflows/release\.yml@refs/tags/v[0-9]'
+SIGN_ISSUER='https://token.actions.githubusercontent.com'
 
 PREFIX="${BW_PREFIX:-$HOME/.local/bin}"
 DIST_URL="${BW_DIST_URL:-}"
@@ -107,6 +125,8 @@ NO_GUM=0
 FROM_SOURCE=0
 FORCE=0
 NO_CHECKSUM=0
+REQUIRE_SIGNATURE="${BW_REQUIRE_SIGNATURE:-0}"
+SIG_STATUS="" # what the signature step concluded, for the summary box
 DRY_RUN=0
 DO_UNINSTALL=0
 NO_CONFIG=0
@@ -265,6 +285,7 @@ while [[ $# -gt 0 ]]; do
     --no-units) NO_UNITS=1; shift ;;
     --no-start) NO_START=1; shift ;;
     --no-verify) NO_CHECKSUM=1; shift ;;
+    --require-signature) REQUIRE_SIGNATURE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --uninstall) DO_UNINSTALL=1; shift ;;
     --quiet | -q) QUIET=1; shift ;;
@@ -284,6 +305,8 @@ done
 # else, the latest GitHub Release. Tags are vX.Y.Z, so a bare X.Y.Z is
 # forgiven.
 if [[ -n "$VERSION" && "$VERSION" != v* ]]; then VERSION="v$VERSION"; fi
+[[ "$NO_CHECKSUM" -eq 1 && "$REQUIRE_SIGNATURE" -eq 1 ]] &&
+  die "--no-verify and --require-signature contradict each other; pass one or the other" 2
 if [[ -n "$DIST_URL" ]]; then
   [[ -z "$VERSION" ]] || die "--version names a GitHub Release, and --dist-url / BW_DIST_URL ($DIST_URL) names somewhere else; pass one or the other" 2
 elif [[ -n "$VERSION" ]]; then
@@ -483,6 +506,53 @@ cross_check_sums() { # file name
   verify_checksum "$1" "$expected" "$2 (SHA256SUMS)"
 }
 
+# Signature verification. The sha256 checks prove the file is what the
+# publisher uploaded; this proves who the publisher was. A release cut by
+# .github/workflows/release.yml carries <asset>.sigstore.json beside each
+# asset, a cosign bundle whose certificate names that workflow at that tag,
+# and only that identity passes. Three outcomes short of a pass are not a
+# failure unless --require-signature: no cosign on this box, no bundle on the
+# dist (a hand-cut release, or a fleet's fileserver), and --no-verify. A
+# bundle that is present but does not verify is always fatal to the caller,
+# because that is the one case where something is actively wrong.
+verify_signature() { # file name → 0 ok/skipped, 1 mismatch (file removed)
+  local file="$1" name="$2" bundle="$TMP/$2.sigstore.json"
+  [[ "$NO_CHECKSUM" -eq 1 ]] && { SIG_STATUS="skipped (--no-verify)"; return 0; }
+  if ! command -v cosign &>/dev/null; then
+    SIG_STATUS="skipped (no cosign on this box)"
+    if [[ "$REQUIRE_SIGNATURE" -eq 1 ]]; then
+      die "--require-signature, but cosign is not installed here. https://docs.sigstore.dev/cosign/system_config/installation/" 3
+    fi
+    info "cosign not found; signature verification skipped, sha256 checks still apply"
+    return 0
+  fi
+  if ! fetch "$DIST_URL/$name.sigstore.json" "$bundle"; then
+    rm -f "$bundle"
+    SIG_STATUS="unsigned dist (no bundle for $name)"
+    if [[ "$REQUIRE_SIGNATURE" -eq 1 ]]; then
+      die "--require-signature, but $DIST_URL carries no signature bundle for $name. A release cut by hand has none; only the release workflow signs." 3
+    fi
+    case "$DIST_URL" in
+      "$RELEASE_BASE"/*) warn "no signature bundle for $name on this release; it was cut by hand. sha256 alone decides" ;;
+      *) info "no signature bundle for $name at $DIST_URL; sha256 alone decides" ;;
+    esac
+    return 0
+  fi
+  local out
+  if ! out=$(cosign verify-blob --bundle "$bundle" \
+    --certificate-identity-regexp "$SIGN_IDENTITY_RE" \
+    --certificate-oidc-issuer "$SIGN_ISSUER" "$file" 2>&1); then
+    err "signature verification FAILED for $name"
+    err "  the bundle does not match the file, or was not signed by the release workflow"
+    printf '%s\n' "$out" | tail -3 | sed 's/^/    /' >&2
+    rm -f "$file"
+    SIG_STATUS="FAILED ($name)"
+    return 1
+  fi
+  SIG_STATUS="verified (release workflow)"
+  ok "signature verified: $name (release workflow at ${MANIFEST_TAG:-a version tag})"
+}
+
 acquire_manifest() {
   phase "Artifacts"
   if [[ "$REPO_MODE" -eq 1 && -z "$DIST_URL" ]]; then
@@ -529,6 +599,11 @@ acquire_manifest() {
   [[ -n "$MANIFEST_COMMIT" ]] || die 'manifest.json has no commit' 3
   ok "manifest: ${MANIFEST_COMMIT:0:12}${MANIFEST_TAG:+ ($MANIFEST_TAG)} generated $gen"
   [[ "$dirty" == "True" ]] && warn "published from a DIRTY tree; it is not exactly this commit"
+  # The manifest is what names every other file's sha256, so its signature is
+  # the root of the chain: a signed manifest makes the tarball's sha256 check
+  # a signed statement too. The tarball is verified on its own as well.
+  verify_signature "$MANIFEST" manifest.json ||
+    die 'manifest.json failed signature verification; nothing was installed' 3
   return 0
 }
 
@@ -561,6 +636,8 @@ else:
     die "$file failed verification; nothing was installed. Re-run to retry the download, or --from-source to build instead" 3
   cross_check_sums "$TMP/bin.tar.gz" "$(basename "$file")" ||
     die "$file disagrees with SHA256SUMS; nothing was installed. Re-run to retry the download, or --from-source to build instead" 3
+  verify_signature "$TMP/bin.tar.gz" "$(basename "$file")" ||
+    die "$file failed signature verification; nothing was installed. If this release was meant to be signed, do not install it; --from-source builds from the tag instead" 3
 
   tar -xzf "$TMP/bin.tar.gz" -C "$TMP" || { warn "extract failed; building from source"; return 1; }
   [[ -f "$TMP/$BIN_NAME" ]] || { warn "tarball had no $BIN_NAME; building from source"; return 1; }
@@ -1285,8 +1362,21 @@ print_plan() {
     "config   → $(config_plan)" \
     "units    → $(units_plan)" \
     "source   → $([[ "$REPO_MODE" -eq 1 && -z "$DIST_URL" ]] && echo "$HERE" || echo "${DIST_URL:-<none>}")" \
+    "verify   → $(verify_plan)" \
     "listen   → $(listen_addr_plan)" \
     "trusts   → $(trusted_plan)"
+}
+
+verify_plan() {
+  if [[ "$NO_CHECKSUM" -eq 1 ]]; then
+    echo "nothing (--no-verify)"
+  elif [[ "$REPO_MODE" -eq 1 && -z "$DIST_URL" ]]; then
+    echo "nothing to verify; building this checkout"
+  elif ! command -v cosign &>/dev/null; then
+    echo "sha256 (manifest.json + SHA256SUMS); no cosign here, so no signature check$([[ "$REQUIRE_SIGNATURE" -eq 1 ]] && echo ' — --require-signature will refuse')"
+  else
+    echo "sha256, then Sigstore bundles against the release workflow$([[ "$REQUIRE_SIGNATURE" -eq 1 ]] && echo ' (required)' || echo ' (when present)')"
+  fi
 }
 
 listen_addr_plan() {
@@ -1312,6 +1402,7 @@ print_summary() {
   lines+=("binary   $PREFIX/$BIN_NAME")
   [[ -f "$CONFIG_FILE" ]] && lines+=("config   $CONFIG_FILE")
   [[ -n "$MANIFEST_COMMIT" ]] && lines+=("commit   ${MANIFEST_COMMIT:0:12}${MANIFEST_TAG:+ ($MANIFEST_TAG)}")
+  [[ -n "$SIG_STATUS" ]] && lines+=("signed   $SIG_STATUS")
   [[ -n "$ip" ]] && lines+=("tailnet  http://$ip:$BRIDGE_PORT")
   lines+=("")
   lines+=("Name it from $PROXY_HOST so it gets a URL:")
