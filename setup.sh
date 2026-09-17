@@ -1,28 +1,36 @@
 #!/usr/bin/env bash
 # beads_watch guided installer — provision a tailnet node end to end.
 #
-# One-liner from the tailnet fileserver (the ?cachebuster matters; dufs and
-# caddy will both happily hand you a stale copy otherwise):
-#   curl -fsSL "https://bw.dev.a44.io/setup.sh?$(date +%s)" | bash
+# One-liner, from the latest GitHub Release:
+#   curl -fsSL https://github.com/a44-io/beads_watch/releases/latest/download/setup.sh | bash
 #
-# The served copy has its dist URL stamped in by scripts/publish-dist.sh. A
-# hand-downloaded copy needs telling where the artifacts live:
-#   curl -fsSL https://bw.dev.a44.io/setup.sh | BW_DIST_URL=https://bw.dev.a44.io bash
+# A specific release:
+#   curl -fsSL https://github.com/a44-io/beads_watch/releases/latest/download/setup.sh | bash -s -- --version v1.2.0
 #
 # Over ssh (prompts work through the tty):
-#   ssh -t box 'curl -fsSL "https://bw.dev.a44.io/setup.sh?$(date +%s)" | bash'
+#   ssh -t box 'curl -fsSL https://github.com/a44-io/beads_watch/releases/latest/download/setup.sh | bash'
 #
 # Fully unattended (takes every default: install, config from discovered repos,
 # units yes, start yes):
-#   ssh box 'curl -fsSL "https://bw.dev.a44.io/setup.sh?$(date +%s)" | bash -s -- --yes'
+#   ssh box 'curl -fsSL https://github.com/a44-io/beads_watch/releases/latest/download/setup.sh | bash -s -- --yes'
 #
-# From a checkout (no fileserver needed):
+# From a checkout (nothing downloaded; builds what is there):
 #   git clone https://github.com/a44-io/beads_watch.git && cd beads_watch && ./setup.sh
+#
+# From a private fileserver (a fleet that publishes with scripts/publish-dist.sh
+# --url … --push …). The served copy has its dist URL stamped in; a
+# hand-downloaded copy needs telling where the artifacts live, and a plain
+# directory or file:// URL works the same way for an offline install:
+#   curl -fsSL https://dist.example.com/setup.sh | BW_DIST_URL=https://dist.example.com bash
+#   ./setup.sh --dist-url /mnt/dist
 #
 # Options:
 #   --prefix DIR      install the binary to DIR (default: ~/.local/bin)
+#   --version TAG     install this GitHub Release instead of the latest; also
+#                     BW_VERSION. Not for use with --dist-url
 #   --dist-url URL    artifact base URL (http://, https://, file://, or a
-#                     plain directory); also BW_DIST_URL
+#                     plain directory); also BW_DIST_URL. Overrides the
+#                     GitHub Release default
 #   --from-source     ignore prebuilt binaries; always build with go
 #   --force           reinstall the binary even when the installed commit is
 #                     current; never touches an existing config
@@ -51,10 +59,14 @@
 # Exit codes: 0 success · 1 a step failed · 2 misuse (bad flag) · 3 infrastructure
 # (missing required tool, unreachable dist server, checksum mismatch).
 #
-# On signatures: artifacts are private and served only inside the tailnet, with
-# sha256 in manifest.json. There is no Sigstore bundle because there is no
-# public release pipeline to sign against. The tailnet ACL is the authenticity
-# boundary; the manifest is the integrity check.
+# On signatures: every download is checked by sha256 against manifest.json,
+# and against SHA256SUMS too when the dist carries one (a GitHub Release
+# does), so `sha256sum -c SHA256SUMS` by hand agrees with what this script
+# checked. Both files ride on the same release as the tarballs, so this is an
+# integrity check, and it says nothing about who uploaded them. There is no
+# Sigstore bundle yet, because releases are cut by an operator's box rather
+# than a CI workflow with an identity worth binding a signature to; that
+# pipeline is a tracked follow-up. --no-verify skips the checks.
 
 set -euo pipefail
 umask 022
@@ -62,11 +74,17 @@ shopt -s lastpipe 2>/dev/null || true
 
 # ── Constants and flag defaults ─────────────────────────────────────────────
 
-# Stamped by scripts/publish-dist.sh --url; empty in the repo copy.
+# Stamped by scripts/publish-dist.sh: the fileserver URL for a --url publish,
+# the release's own download base for a --release; empty in the repo copy.
 DEFAULT_DIST_URL=""
 
+# The public channel, when nothing above or on the command line says otherwise.
+RELEASE_REPO="a44-io/beads_watch"
+RELEASE_BASE="https://github.com/$RELEASE_REPO/releases"
+
 PREFIX="${BW_PREFIX:-$HOME/.local/bin}"
-DIST_URL="${BW_DIST_URL:-$DEFAULT_DIST_URL}"
+DIST_URL="${BW_DIST_URL:-}"
+VERSION="${BW_VERSION:-}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/beads_watch"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -233,6 +251,7 @@ need_value() { [[ -n "${2:-}" ]] || die "$1 needs a value" 2; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix) need_value --prefix "${2:-}"; PREFIX="$2"; shift 2 ;;
+    --version) need_value --version "${2:-}"; VERSION="$2"; shift 2 ;;
     --dist-url) need_value --dist-url "${2:-}"; DIST_URL="${2%/}"; shift 2 ;;
     --repo) need_value --repo "${2:-}"; CLI_REPOS+=("$2"); shift 2 ;;
     --port) need_value --port "${2:-}"; BRIDGE_PORT="$2"; shift 2 ;;
@@ -257,6 +276,23 @@ done
 
 [[ "$BRIDGE_PORT" =~ ^[0-9]+$ ]] || die "--port wants a number, got '$BRIDGE_PORT'" 2
 [[ "$NO_CONFIG" -eq 1 && "$REWRITE_CONFIG" -eq 1 ]] && die "--no-config and --rewrite-config contradict each other" 2
+
+# Where the artifacts come from, in order: an explicit --dist-url / BW_DIST_URL
+# (a fleet's fileserver, a directory, a file:// URL); --version, which names a
+# GitHub Release; the URL publish-dist.sh stamped into this copy; the checkout
+# this script sits in; and, for a bare copy of the repo file run anywhere
+# else, the latest GitHub Release. Tags are vX.Y.Z, so a bare X.Y.Z is
+# forgiven.
+if [[ -n "$VERSION" && "$VERSION" != v* ]]; then VERSION="v$VERSION"; fi
+if [[ -n "$DIST_URL" ]]; then
+  [[ -z "$VERSION" ]] || die "--version names a GitHub Release, and --dist-url / BW_DIST_URL ($DIST_URL) names somewhere else; pass one or the other" 2
+elif [[ -n "$VERSION" ]]; then
+  DIST_URL="$RELEASE_BASE/download/$VERSION"
+elif [[ -n "$DEFAULT_DIST_URL" ]]; then
+  DIST_URL="$DEFAULT_DIST_URL"
+elif [[ "$REPO_MODE" -eq 0 ]]; then
+  DIST_URL="$RELEASE_BASE/latest/download"
+fi
 
 # ── Platform ────────────────────────────────────────────────────────────────
 
@@ -409,6 +445,7 @@ preflight() {
 MANIFEST=""
 MANIFEST_COMMIT=""
 MANIFEST_TAG=""
+SUMS="" # SHA256SUMS beside the manifest, when the dist has one
 
 manifest_field() { # manifest_field '["bundle"]["sha256"]'
   python3 -c '
@@ -424,9 +461,26 @@ except Exception:
 
 fetch() { # url dest
   case "$DIST_URL" in
-    file://*) cp "${1#file://}" "$2" ;;
+    file://*) cp "${1#file://}" "$2" 2>/dev/null ;;
     *) curl -fsSL "${PROXY_ARGS[@]}" "$1" -o "$2" ;;
   esac
+}
+
+# The sha256 SHA256SUMS records for NAME (a bare file name, as sha256sum
+# writes it), or nothing when there is no SHA256SUMS or no line for it.
+sums_sha_for() {
+  [[ -n "$SUMS" ]] || return 0
+  awk -v f="$1" '$2 == f || $2 == "*" f { print $1; exit }' "$SUMS"
+}
+
+# The manifest already carries a sha256 for every file; SHA256SUMS is the
+# same fact in the format a person checks by hand, so a file is held to both
+# when both exist. verify_checksum removes the file on a mismatch.
+cross_check_sums() { # file name
+  local expected
+  expected=$(sums_sha_for "$2")
+  [[ -n "$expected" ]] || return 0
+  verify_checksum "$1" "$expected" "$2 (SHA256SUMS)"
 }
 
 acquire_manifest() {
@@ -438,8 +492,8 @@ acquire_manifest() {
   fi
 
   [[ -n "$DIST_URL" ]] || die "not inside a beads_watch checkout and no dist URL configured.
-    Pass --dist-url https://bw.dev.a44.io (or export BW_DIST_URL), or run this
-    script from a checkout." 3
+    Pass --dist-url URL (or export BW_DIST_URL), pass --version vX.Y.Z for a
+    GitHub Release, or run this script from a checkout." 3
 
   case "$DIST_URL" in
     http://* | https://* | file://*) ;;
@@ -450,8 +504,22 @@ acquire_manifest() {
   command -v python3 &>/dev/null || die 'python3 is required to read manifest.json' 3
 
   MANIFEST="$TMP/manifest.json"
-  fetch "$DIST_URL/manifest.json" "$MANIFEST" ||
-    die "cannot reach $DIST_URL/manifest.json (is the tailnet up?)" 3
+  if ! fetch "$DIST_URL/manifest.json" "$MANIFEST"; then
+    case "$DIST_URL" in
+      "$RELEASE_BASE"/*) die "cannot fetch $DIST_URL/manifest.json (no route to github.com, or ${VERSION:-the latest release} does not exist or is not public yet)" 3 ;;
+      *) die "cannot reach $DIST_URL/manifest.json (is the fileserver up, and this box on its network?)" 3 ;;
+    esac
+  fi
+
+  # Optional: a fileserver publish has no SHA256SUMS, a release always does.
+  SUMS="$TMP/SHA256SUMS"
+  if fetch "$DIST_URL/SHA256SUMS" "$SUMS"; then
+    cross_check_sums "$MANIFEST" manifest.json || die 'manifest.json failed verification' 3
+  else
+    rm -f "$SUMS"
+    SUMS=""
+    info "no SHA256SUMS at $DIST_URL; verifying from manifest.json alone"
+  fi
 
   MANIFEST_COMMIT=$(manifest_field '["commit"]')
   MANIFEST_TAG=$(manifest_field '["tag"]')
@@ -486,7 +554,13 @@ else:
 
   info "downloading $file"
   fetch "$DIST_URL/$file" "$TMP/bin.tar.gz" || { warn "download failed; building from source"; return 1; }
-  verify_checksum "$TMP/bin.tar.gz" "$sha" "$file" || return 1
+  # A mismatch between a dist and its own checksums is a broken or tampered
+  # download, and the header promises exit 3 for it. Quietly building from
+  # source instead would hide the one signal that matters here.
+  verify_checksum "$TMP/bin.tar.gz" "$sha" "$file" ||
+    die "$file failed verification; nothing was installed. Re-run to retry the download, or --from-source to build instead" 3
+  cross_check_sums "$TMP/bin.tar.gz" "$(basename "$file")" ||
+    die "$file disagrees with SHA256SUMS; nothing was installed. Re-run to retry the download, or --from-source to build instead" 3
 
   tar -xzf "$TMP/bin.tar.gz" -C "$TMP" || { warn "extract failed; building from source"; return 1; }
   [[ -f "$TMP/$BIN_NAME" ]] || { warn "tarball had no $BIN_NAME; building from source"; return 1; }
@@ -510,18 +584,34 @@ build_from_source() { # leaves the binary at $TMP/beads_watch
   if [[ "$REPO_MODE" -eq 1 && -z "$DIST_URL" ]]; then
     src="$HERE"
   else
-    local bundle sha
-    bundle="$TMP/beads_watch.bundle"
-    sha=$(manifest_field '["bundle"]["sha256"]')
-    info "downloading source bundle"
-    fetch "$DIST_URL/$(manifest_field '["bundle"]["file"]')" "$bundle" ||
-      die 'could not download the source bundle' 3
-    verify_checksum "$bundle" "$sha" "beads_watch.bundle" || die 'bundle failed verification' 3
-    command -v git &>/dev/null || die 'git is required to build from the bundle' 3
-
+    command -v git &>/dev/null || die 'git is required to build from source' 3
     rm -rf "$SRC_DIR"
     mkdir -p "$(dirname "$SRC_DIR")"
-    git clone -q "$bundle" "$SRC_DIR" 2>/dev/null || die 'could not clone the bundle' 1
+
+    local bundle_file
+    bundle_file=$(manifest_field '["bundle"]["file"]')
+    if [[ -n "$bundle_file" ]]; then
+      # A fileserver publish ships the source as a git bundle of HEAD.
+      local bundle sha
+      bundle="$TMP/beads_watch.bundle"
+      sha=$(manifest_field '["bundle"]["sha256"]')
+      info "downloading source bundle"
+      fetch "$DIST_URL/$bundle_file" "$bundle" ||
+        die 'could not download the source bundle' 3
+      verify_checksum "$bundle" "$sha" "beads_watch.bundle" || die 'bundle failed verification' 3
+      git clone -q "$bundle" "$SRC_DIR" 2>/dev/null || die 'could not clone the bundle' 1
+    else
+      # A GitHub Release carries no bundle: the public repo is the source, at
+      # the release's tag. A manifest without a tag means main.
+      local ref="${MANIFEST_TAG:-main}"
+      info "cloning https://github.com/$RELEASE_REPO at $ref"
+      git clone -q --depth 1 --branch "$ref" "https://github.com/$RELEASE_REPO.git" "$SRC_DIR" 2>/dev/null ||
+        die "could not clone https://github.com/$RELEASE_REPO at $ref (no route to github.com, or the tag is not public yet)" 3
+      local got
+      got=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || echo "")
+      [[ -z "$MANIFEST_COMMIT" || "$got" == "$MANIFEST_COMMIT" ]] ||
+        warn "$ref is at ${got:0:12}, but the release was built from ${MANIFEST_COMMIT:0:12}; building what $ref has"
+    fi
     src="$SRC_DIR"
     ok "source at $SRC_DIR"
   fi
@@ -590,8 +680,9 @@ listen_addr() {
 }
 
 # The tailnet IPv4 of a box named the way people name it: a MagicDNS name, or
-# an ssh alias for one (`ssh pi` is how the README addresses the caddy box,
-# and its Host entry knows the real name). Empty when neither resolves.
+# an ssh alias for one (an operator who reaches the proxy box as `ssh <alias>`
+# passes that alias, and its Host entry knows the real name). Empty when
+# neither resolves.
 proxy_host_ip() {
   local name="$1" ip="" via
   ip=$(tailscale ip -4 "$name" 2>/dev/null | head -1) || true
