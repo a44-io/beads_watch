@@ -1,6 +1,6 @@
 # beads_watch
 
-Read and write [beads](https://github.com/Dicklesworthstone/beads_rust) from any
+Read and write [beads_rust](https://github.com/Dicklesworthstone/beads_rust) from any
 machine on the tailnet, without ssh.
 
 `beads_watch` is a pipe to `br`. It runs the real binary in the real repo and
@@ -13,15 +13,21 @@ issue, no hand-written route per subcommand. That is the entire design:
 - Nothing can drift, because there is no second implementation to drift from.
 - A `br` upgrade adds features here for free.
 
-A previous attempt reimplemented beads semantics in ~200k lines of Rust. Its
-`/ready` returned 172 issues on a repo where `br ready` returned 96; the two
-predicates had quietly diverged. This daemon cannot develop that bug.
-
-**Contents**: [Quick example](#quick-example) · [Architecture](#architecture) ·
-[API](#api) · [Identity](#identity) · [Security](#security) ·
-[Events](#events) · [Install](#install) · [Releases](#releases) · [CLI](#cli) ·
-[Configuration](#configuration) · [Troubleshooting](#troubleshooting) ·
-[Limitations](#limitations) · [FAQ](#faq)
+<p align="center">
+  <a href="#quick-example">Quick example</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#api">API</a> ·
+  <a href="#identity">Identity</a> ·
+  <a href="#security">Security</a> ·
+  <a href="#events">Events</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#releases">Releases</a> ·
+  <a href="#cli">CLI</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
+  <a href="#limitations">Limitations</a> ·
+  <a href="#faq">FAQ</a>
+</p>
 
 ## Quick example
 
@@ -67,7 +73,7 @@ curl -s 127.0.0.1:7717/v1/repos/demo/br -d '{"args":["stats"]}'
 |---|---|
 | **No second implementation** | The daemon shells out to `br`. There is no query layer to disagree with the CLI. |
 | **Exit codes survive** | `br`'s typed exit code comes back in `X-Br-Exit`, so a failed `br` still reaches the client as `br` output. |
-| **Identity from the transport** | `BD_ACTOR` is set from what the proxy observed, not from what the caller claimed. |
+| **Identity from the transport** | `BD_ACTOR` comes from what the proxy observed about the connection; the caller's own claims are ignored. |
 | **Free upgrades** | New `br` subcommands are reachable the moment the binary changes, unless the allowlist excludes them. |
 | **Works from a phone** | It is HTTPS on the tailnet. Any client that can POST JSON is a beads client. |
 | **Events without polling** | Opt in, and every mutation lands on an ntfy topic within a second. |
@@ -91,7 +97,7 @@ beads_watch          listen 100.110.83.42:8438 (tailscale IP only)
 Caddy on pi does the transport: HTTPS with a real wildcard cert, listening
 only on the tailnet address. On each serving box the daemon binds that box's
 own tailscale IP, so caddy reaches it directly and the daemon sees the real
-peer of every connection — which is what lets it believe caddy's forwarded
+peer of every connection, which is what lets it believe caddy's forwarded
 identity and nobody else's. The daemon still writes zero auth and zero TLS.
 (`tailscale serve` used to play caddy's role, and a `systemd-socket-proxyd`
 bridge used to sit between caddy and the socket; the bridge erased the peer,
@@ -117,8 +123,9 @@ Liveness. Runs no `br`, so it stays up even when a repo is broken.
 
 `repos` counts every configured repo, including any whose path is not usable
 on this box right now. When there are some, a `repos_unavailable` count
-appears beside it; when there are none, the field is absent. That is the
-one-glance signal that some `POST /v1/repos/{repo}/br` calls will answer 503.
+appears beside it; when there are none, the field is absent. Its presence
+tells you at a glance that some `POST /v1/repos/{repo}/br` calls will answer
+503.
 
 ### `GET /v1/repos`
 
@@ -149,8 +156,8 @@ or directory` rather than a `chdir` failure out of the exec.
 ### `GET /v1/whoami`
 
 Reports exactly which identity headers arrived and what the daemon made of
-them. Tagged devices and user-owned nodes behave differently, so this exists
-to settle the question by observation instead of assumption:
+them. Tagged devices and user-owned nodes behave differently, and this
+endpoint shows which case a caller landed in:
 
 ```json
 {
@@ -166,7 +173,7 @@ to settle the question by observation instead of assumption:
 `transport` is what the listener knew before any header arrived: which
 listener the connection came in on, the TCP peer, and whether that peer is
 in `trusted_proxies`. Identity is decided from it; see [Identity](#identity).
-Reach for this endpoint first whenever a write lands under the wrong
+Check this endpoint first whenever a write lands under the wrong
 `created_by`.
 
 ### `POST /v1/repos/{repo}/br`
@@ -192,10 +199,11 @@ The response body is `br`'s stdout, unmodified. Metadata rides in headers:
 
 **`X-Br-Exit` present means `br` ran, and the body is `br`'s own output.**
 
-HTTP 200 is returned whenever `br` ran at all, including when it failed. `br`
-failing is data, not a daemon error. Flattening exit 3 into HTTP 404 would
-erase the difference between not-found, validation, and dependency-cycle, so
-the code is passed through untranslated:
+HTTP 200 is returned whenever `br` ran at all, including when it failed. A
+failed `br` is still an answer from `br`, and the client needs to see it as
+one. Flattening exit 3 into HTTP 404 would erase the difference between
+not-found, validation, and dependency-cycle, so the code is passed through
+untranslated:
 
 ```console
 $ curl -sD- -X POST .../v1/repos/cell/br -d '{"args":["show","nonexistent-999"]}'
@@ -262,9 +270,9 @@ this node does not serve is a 404 envelope. A `: ping` comment every 30s
 keeps idle proxies from dropping the connection, and the handler never runs
 `br`, so a stream can stay open indefinitely.
 
-What it watches is the point. A read-only `br list` opens the database's
-WAL and lock files for writing and would ring anything watching `.beads/`
-— including the daemon's own `/br` handler serving the very client that is
+Which file it watches matters. A read-only `br list` opens the database's
+WAL and lock files for writing and would ring anything watching `.beads/`,
+including the daemon's own `/br` handler serving the very client that is
 listening. Only the JSONL export moves when `br` mutated something, so the
 bell is a fingerprint (size and mtime) of that one file, stat'd once a
 second and debounced so a multi-file export rings once. A `br list`, through
@@ -299,7 +307,7 @@ splits callers into three cases:
      address, so a caller's forged prefix loses; `tailscale serve` *replaces*
      the header outright. Either way the address that wins is
      transport-observed, then resolved with `tailscale whois`.
-- **Any other TCP peer** — a caller that reaches `:8438` directly. Its
+- **Any other TCP peer** (a caller that reaches `:8438` directly). Its
   headers are its own claims and are not read at all. Its *address* is the
   transport's fact, so that is what gets resolved, and it lands in the audit
   trail as its own machine: `source: tailscale-whois-direct`, `verified:
@@ -315,25 +323,24 @@ Then, for every case:
    is not a tailnet node (`127.0.0.1` in a `--listen` trial, say).
 4. **Nothing**: `BD_ACTOR` is left unset and `br` uses its own default.
 
-The proxy behaviours were verified by experiment (tailscale 1.98.9; caddy via
-the live `beads-arch.dev.a44.io` chain), not assumed, and the direct-peer
-rule has unit tests against a fake `tailscale whois`. A request from `dev`
+The proxy behaviours above were established by experiment (tailscale 1.98.9;
+caddy via the live `beads-arch.dev.a44.io` chain), and the direct-peer rule
+has unit tests against a fake `tailscale whois`. A request from `dev`
 through caddy resolves to `actor: dev`, `source: tailscale-whois`,
 `verified: true`, and one carrying forged headers still does. The same
 forged headers sent straight to `arch:8438` from `dev` resolve to `dev` as
-well — by a different route, which `X-Br-Actor-Source` records.
+well, by a different route that `X-Br-Actor-Source` records.
 
 `trusted_proxies` takes IPs or CIDRs. An empty list trusts nobody: traffic
 through an unlisted proxy is still served, attributed to the proxy *machine*
-(that is the peer the transport sees), which is honest and also the sign
-that the list is missing an entry.
+(that is the peer the transport sees), which is accurate as far as it goes
+and also the sign that the list is missing an entry.
 
 **On this tailnet, user identity is not available.** 13 of 15 nodes are
 `tagged-devices`, which have no owning user for tailscale to report. So the
-actor is the *machine*: a write from `dev` records `created_by: "dev"`. That is
-a real, transport-verified fact rather than an invented name. For the same
-reason, the daemon reports `"source": "none"` instead of guessing when it
-knows nothing.
+actor is the *machine*: a write from `dev` records `created_by: "dev"`, which
+the transport has verified. For the same reason, when the daemon knows
+nothing it reports `"source": "none"` and does not guess.
 
 ## Security
 
@@ -510,9 +517,9 @@ scripts/publish-dist.sh --tag v0.2.0 --push-tag \
 ```
 
 It refuses to publish from a dirty tree, because the bundle it builds is `HEAD`
-and uncommitted changes would silently not be what gets served. `--allow-dirty`
-overrides that and marks `"dirty": true` in the manifest, which `setup.sh`
-warns about on the way in.
+and uncommitted changes would be left out of what gets served with nothing to
+flag it. `--allow-dirty` overrides that and marks `"dirty": true` in the
+manifest, which `setup.sh` warns about on the way in.
 
 What lands on the fileserver:
 
@@ -545,8 +552,7 @@ built:  2026-09-09T13:17:48Z
 ```
 
 `GET /v1/health` grows a `commit` field on a published binary too. A source
-build reports neither, which is the honest answer rather than a guess:
-unstamped code cannot say which commit it is.
+build reports neither, since unstamped code cannot say which commit it is.
 
 ## CLI
 
@@ -567,8 +573,8 @@ touching `~/.config`; note that it means the config file is not read at all.
 
 ## Configuration
 
-Unknown keys are a hard error rather than a warning, so a typo fails startup
-instead of silently doing nothing.
+Unknown keys are a hard error, so a typo fails startup instead of being
+ignored.
 
 ```json
 {
@@ -619,12 +625,12 @@ hand-managed box should upgrade the binary first.
 ### HTTP 502 with an empty body
 
 Caddy is up and the daemon behind it is not answering on `listen`. Either
-the daemon is down, or it is up but serving the socket only — check that the
+the daemon is down, or it is up but serving the socket only; check that the
 config has a `listen` address and the journal shows it on the `serving`
 line. A daemon that cannot start (a config it refuses) is retried five times
-in a minute and then left `failed`,
-which is the state that shows up in `--failed`; a unit still inside those
-retries reports `activating (auto-restart)` for a few seconds first:
+in a minute and then left `failed`, which is the state that shows up in
+`--failed`; a unit still inside those retries reports
+`activating (auto-restart)` for a few seconds first:
 
 ```bash
 systemctl --user --failed
@@ -643,10 +649,10 @@ systemctl --user reset-failed beads_watch && systemctl --user start beads_watch
 
 A configured repo path is gone, or is not a directory. The daemon says so once
 at startup, keeps serving every other repo, and answers `503 REPO_UNAVAILABLE`
-for that one. It is worth fixing anyway, because a repo that is quietly
-missing on one box is exactly the kind of drift nobody notices: either restore
-the directory (a `git clone` is enough, no restart needed, since the path is
-probed per request) or drop the entry from the config.
+for that one. Fix it anyway, because a repo missing on one box is the kind of
+drift nobody notices: either restore the directory (a `git clone` is enough,
+no restart needed, since the path is probed per request) or drop the entry
+from the config.
 
 ```bash
 beads_watch --print-config     # warns on stderr, names each unusable repo
@@ -661,9 +667,9 @@ both cases, which makes this one easy to misread; the 503's hint says as much.
 
 ### `no servable repos: …` and the unit will not start
 
-Every configured path failed. That is a config error, not drift, and the
-daemon refuses rather than coming up to serve nothing. The message lists each
-repo with its own reason. Also expect this when the unit's sandbox hides
+Every configured path failed. Unlike one missing repo, this is a config
+error, and the daemon refuses to come up and serve nothing. The message lists
+each repo with its own reason. Also expect this when the unit's sandbox hides
 *all* of them, for instance every repo under a directory the service cannot
 see. Fix the config, then `systemctl --user reset-failed beads_watch &&
 systemctl --user start beads_watch`.
@@ -687,8 +693,8 @@ means caddy's address is not in `trusted_proxies`, so the daemon is
 identifying caddy itself instead of reading its headers. `source: none` with
 `trusted_proxy: true` means the headers are not arriving: the site file is
 missing the `header_up -Tailscale-User-Login` strip, or `X-Forwarded-For` is
-not reaching the daemon. On a tagged device an actor of the *machine* name
-is correct rather than a bug; see [Identity](#identity).
+not reaching the daemon. On a tagged device, an actor equal to the *machine*
+name is the expected result; see [Identity](#identity).
 
 ### HTTP 403 `COMMAND_NOT_ALLOWED`
 
@@ -700,7 +706,7 @@ list rather than adding to it.
 
 A previous process still holds the socket. `beads_watch` refuses to steal a
 socket from a live daemon but clears a stale one, so this means something is
-genuinely listening:
+really listening:
 
 ```bash
 systemctl --user status beads_watch
@@ -774,7 +780,7 @@ The socket, mode `0600`, is for local callers: it shuts out every other
 local user on a box running agent swarms, which localhost TCP would not. The
 TCP listener is for the tailnet, and it is the daemon's own rather than a
 bridge's because only the process that accepts the connection knows who the
-peer is — and that is what tells caddy apart from anyone else.
+peer is, and that is what tells caddy apart from anyone else.
 
 ### Why is my actor the machine name and not a person?
 
@@ -794,7 +800,7 @@ each repo resolves to, and `GET /v1/whoami` for what it thinks of the caller.
 write these repos concurrently and waiting beats a client retry loop.
 
 `--json` is injected only when the caller did not choose a format, so
-`--format toon` and `--format csv` still work and get an honest `Content-Type`.
+`--format toon` and `--format csv` still work and get a matching `Content-Type`.
 
 `br` 0.2.22 has **no `-C` flag**; the daemon targets a repo by setting the
 child process's working directory, which is also what makes `.beads/redirect`
