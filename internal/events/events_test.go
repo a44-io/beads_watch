@@ -86,37 +86,16 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-func TestConfigNormalize(t *testing.T) {
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	os.WriteFile(tokenFile, []byte("tk_secret\n"), 0o600)
-
-	c := &Config{URL: "https://ntfy.example.com/", Topic: "beads-events", TokenFile: tokenFile}
+// The node default comes from the hostname, so it cannot be pinned in
+// TestConfigNormalize's whole-struct comparison; what matters is that it is
+// non-empty and already tag-safe, since Normalize rejects any other value.
+func TestConfigNodeDefault(t *testing.T) {
+	c := &Config{URL: "https://ntfy.example.com", Topic: "beads-events", StateFile: filepath.Join(t.TempDir(), "cursor.json")}
 	if err := c.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if c.URL != "https://ntfy.example.com" {
-		t.Errorf("URL not trimmed: %q", c.URL)
-	}
-	if c.Token != "tk_secret" {
-		t.Errorf("token_file not read: %q", c.Token)
-	}
-	if c.PollMS != 1000 || c.AgentTopicPrefix != "agent-" || !*c.RouteAssignments {
-		t.Errorf("defaults wrong: %+v", c)
-	}
 	if c.Node == "" || sanitizeTag(c.Node) != c.Node {
 		t.Errorf("node default not tag-safe: %q", c.Node)
-	}
-
-	for _, bad := range []Config{
-		{Topic: "beads"},                          // no url
-		{URL: "ntfy.example.com", Topic: "beads"}, // no scheme
-		{URL: "https://x", Topic: "no spaces!"},   // bad topic
-		{URL: "https://x", Topic: "b", TokenFile: "/nonexistent-path-xyz"},
-	} {
-		bad := bad
-		if err := bad.Normalize(); err == nil {
-			t.Errorf("Normalize(%+v) should have failed", bad)
-		}
 	}
 }
 
@@ -204,7 +183,10 @@ func (c *capture) handler() http.Handler {
 			return
 		}
 		var ev Event
-		json.NewDecoder(r.Body).Decode(&ev)
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&ev); err != nil {
+			http.Error(w, "bad event body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 		c.reqs = append(c.reqs, capturedReq{
 			topic: strings.TrimPrefix(r.URL.Path, "/"),
 			title: r.URL.Query().Get("title"),

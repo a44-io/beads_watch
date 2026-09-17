@@ -103,8 +103,10 @@ type repoTail struct {
 	hasTitle       bool
 	hasAssignee    bool
 
-	lastSig  string
-	lastPoll time.Time
+	// lastStamp is the stat stamp (sizes and mtimes) the last drain saw; a
+	// change detector, nothing cryptographic.
+	lastStamp string
+	lastPoll  time.Time
 }
 
 func (w *Watcher) watchRepo(ctx context.Context, repo Repo) {
@@ -131,9 +133,9 @@ func (w *Watcher) watchRepo(ctx context.Context, repo Repo) {
 			return
 		case <-tick.C:
 		}
-		sig := t.signature()
+		stamp := t.statStamp()
 		forced := time.Since(t.lastPoll) >= forcePoll
-		if sig == t.lastSig && !forced {
+		if stamp == t.lastStamp && !forced {
 			continue
 		}
 		if err := t.drain(ctx); err != nil {
@@ -142,7 +144,7 @@ func (w *Watcher) watchRepo(ctx context.Context, repo Repo) {
 			w.log.Warn("events: drain failed, will retry", "repo", repo.Name, "err", err)
 			continue
 		}
-		t.lastSig = sig
+		t.lastStamp = stamp
 		t.lastPoll = time.Now()
 	}
 }
@@ -232,10 +234,11 @@ func (t *repoTail) maxID(ctx context.Context) (int64, error) {
 	return 0, fmt.Errorf("MAX(id) query returned no usable row")
 }
 
-// signature is a cheap change detector over the files a mutation touches. Any
-// difference (or its once-a-minute absence) triggers a real cursor query; a
-// spurious trigger costs one cheap SELECT that finds nothing.
-func (t *repoTail) signature() string {
+// statStamp is a cheap change detector over the files a mutation touches: their
+// sizes and mtimes, joined. Any difference (or its once-a-minute absence)
+// triggers a real cursor query; a spurious trigger costs one cheap SELECT that
+// finds nothing.
+func (t *repoTail) statStamp() string {
 	var b strings.Builder
 	for _, p := range []string{t.db, t.db + "-wal", t.jsonl} {
 		if fi, err := os.Stat(p); err == nil {

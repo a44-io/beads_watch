@@ -208,6 +208,47 @@ func TestRequestActorIsUnverified(t *testing.T) {
 	}
 }
 
+// A self-asserted actor is the one response-header value a caller controls
+// outright. One with a line break in it never reaches a header at all:
+// validActor refuses control characters up front (for the audit trail's
+// sake), so the response is a 400 with no X-Br-* headers and nothing split.
+func TestActorWithLineBreakIsRefused(t *testing.T) {
+	s, _ := testServer(t, `printf '%s' "$BD_ACTOR"`)
+
+	rec := post(t, s, "demo", `{"args":["create","x"],"actor":"evil\r\nInjected: yes"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an actor with control characters", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "ACTOR_INVALID") {
+		t.Errorf("body = %q, want ACTOR_INVALID", rec.Body.String())
+	}
+	if got := rec.Header().Get("Injected"); got != "" {
+		t.Errorf("Injected header present (%q): the actor split the response headers", got)
+	}
+	if got := rec.Header().Get("X-Br-Actor"); got != "" {
+		t.Errorf("X-Br-Actor = %q, want none: br never ran", got)
+	}
+}
+
+// The other X-Br-* values are not screened by validActor: the repo name is
+// the operator's, stderr is br's, a whois actor is tailscaled's. setHeader is
+// the one place they pass through, and it flattens a line break to a space
+// so a value can never terminate the header it is in.
+func TestSetHeaderFlattensLineBreaks(t *testing.T) {
+	h := http.Header{}
+	setHeader(h, "X-Br-Repo", "name\r\nInjected: yes")
+	setHeader(h, "X-Br-Stderr", "line one\nline two")
+	if got := h.Values("X-Br-Repo"); len(got) != 1 || strings.ContainsAny(got[0], "\r\n") {
+		t.Errorf("X-Br-Repo = %q, want one value without line breaks", got)
+	}
+	if got := h.Get("X-Br-Stderr"); got != "line one line two" {
+		t.Errorf("X-Br-Stderr = %q, want the newline flattened to a space", got)
+	}
+	if got := h.Get("Injected"); got != "" {
+		t.Errorf("Injected = %q, want no such header", got)
+	}
+}
+
 // --- identity by transport ---------------------------------------------------
 
 // fakeTailscale answers `tailscale whois --json <addr>` for two made-up

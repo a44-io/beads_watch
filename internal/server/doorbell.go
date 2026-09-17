@@ -162,8 +162,9 @@ func (d *doorbell) watchPath(ctx context.Context, name, path string) {
 			return
 		case <-tick.C:
 		}
-		sig := fingerprint(path)
-		if sig == last {
+		// A stat stamp, not a signature: size and mtime, compared for change.
+		cur := fingerprint(path)
+		if cur == last {
 			continue
 		}
 		// Debounce: an export that lands in several writes rings once, and

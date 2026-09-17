@@ -107,6 +107,18 @@ func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// setHeader writes one response header with CR and LF flattened to spaces.
+// Every X-Br-* value comes from outside the daemon: the repo name from the
+// config file, stderr from br, the actor from tailscaled or, self-asserted,
+// from the request body (that one is refused by validActor before it gets
+// here). net/http already rewrites CR and LF in header values to spaces, so a
+// header cannot be split whatever reaches it; this makes that guarantee ours
+// instead of the stdlib's, and gives every such value one place to pass
+// through.
+func setHeader(h http.Header, key, value string) {
+	h.Set(key, strings.NewReplacer("\r", " ", "\n", " ").Replace(value))
+}
+
 // --- transport ------------------------------------------------------------
 
 // Transport is what the listener knew about a connection before a byte of
@@ -452,13 +464,13 @@ func (s *Server) handleBr(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	// X-Br-Exit is the discriminator: present means br ran and this body is
 	// br's own output. Absent means the daemon failed before br spoke.
-	h.Set("X-Br-Exit", strconv.Itoa(res.ExitCode))
-	h.Set("X-Br-Repo", repo.Name)
-	h.Set("X-Br-Duration-Ms", strconv.FormatInt(res.Duration.Milliseconds(), 10))
-	h.Set("X-Br-Actor-Source", id.Source)
+	setHeader(h, "X-Br-Exit", strconv.Itoa(res.ExitCode))
+	setHeader(h, "X-Br-Repo", repo.Name)
+	setHeader(h, "X-Br-Duration-Ms", strconv.FormatInt(res.Duration.Milliseconds(), 10))
+	setHeader(h, "X-Br-Actor-Source", id.Source)
 	if id.Actor != "" {
-		h.Set("X-Br-Actor", id.Actor)
-		h.Set("X-Br-Actor-Verified", strconv.FormatBool(id.Verified))
+		setHeader(h, "X-Br-Actor", id.Actor)
+		setHeader(h, "X-Br-Actor-Verified", strconv.FormatBool(id.Verified))
 	}
 	if res.StdoutTruncated {
 		h.Set("X-Br-Stdout-Truncated", "1")
@@ -470,7 +482,7 @@ func (s *Server) handleBr(w http.ResponseWriter, r *http.Request) {
 		if len(e) > maxStderrHeader {
 			e = e[:maxStderrHeader]
 		}
-		h.Set("X-Br-Stderr", base64.StdEncoding.EncodeToString(e))
+		setHeader(h, "X-Br-Stderr", base64.StdEncoding.EncodeToString(e))
 	}
 	h.Set("Content-Type", contentType)
 	h.Set("X-Content-Type-Options", "nosniff")
