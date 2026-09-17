@@ -235,8 +235,10 @@ TARBALLS=()
 if [[ "$WITH_BINARY" -eq 1 ]]; then
   BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   LDFLAGS="-s -w"
-  LDFLAGS+=" -X beads_watch/internal/server.Commit=$COMMIT"
-  LDFLAGS+=" -X beads_watch/internal/server.BuiltAt=$BUILT_AT"
+  # The -X targets are full import paths; they must track go.mod's module
+  # line, or the stamp silently lands nowhere and the binary reports no commit.
+  LDFLAGS+=" -X github.com/a44-io/beads_watch/internal/server.Commit=$COMMIT"
+  LDFLAGS+=" -X github.com/a44-io/beads_watch/internal/server.BuiltAt=$BUILT_AT"
 
   IFS=',' read -r -a target_list <<<"$TARGETS"
   for target in "${target_list[@]}"; do

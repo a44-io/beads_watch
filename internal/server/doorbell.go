@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"beads_watch/internal/brexec"
+	"github.com/a44-io/beads_watch/internal/brexec"
 )
 
 // The doorbell is GET /v1/events: a server-sent event per served repo each

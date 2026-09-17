@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"beads_watch/internal/events"
+	"github.com/a44-io/beads_watch/internal/events"
 )
 
 // TestMissingRepoPathIsNotFatal is the fix for the crash loop: one archived

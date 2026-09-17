@@ -14,7 +14,7 @@ import (
 	"sync"
 	"testing"
 
-	"beads_watch/internal/brexec"
+	"github.com/a44-io/beads_watch/internal/brexec"
 )
 
 func TestTitles(t *testing.T) {

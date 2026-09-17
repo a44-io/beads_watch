@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"beads_watch/internal/brexec"
+	"github.com/a44-io/beads_watch/internal/brexec"
 )
 
 const (

@@ -23,8 +23,8 @@ import (
 	"syscall"
 	"time"
 
-	"beads_watch/internal/events"
-	"beads_watch/internal/server"
+	"github.com/a44-io/beads_watch/internal/events"
+	"github.com/a44-io/beads_watch/internal/server"
 )
 
 func main() {

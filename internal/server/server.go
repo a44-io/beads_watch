@@ -15,17 +15,17 @@ import (
 	"strings"
 	"sync"
 
-	"beads_watch/internal/brexec"
-	"beads_watch/internal/tsidentity"
+	"github.com/a44-io/beads_watch/internal/brexec"
+	"github.com/a44-io/beads_watch/internal/tsidentity"
 )
 
 // Version is stamped on every response so a client can tell which daemon
 // answered without a separate round trip.
-const Version = "1.1.0"
+const Version = "1.1.1"
 
 // Commit and BuiltAt are stamped at link time by scripts/publish-dist.sh:
 //
-//	go build -ldflags "-X beads_watch/internal/server.Commit=$(git rev-parse HEAD)"
+//	go build -ldflags "-X github.com/a44-io/beads_watch/internal/server.Commit=$(git rev-parse HEAD)"
 //
 // A source build leaves them empty, which is the honest answer: an unstamped
 // binary cannot say which commit it came from. The publisher relies on this to

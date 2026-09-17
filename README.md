@@ -435,9 +435,11 @@ From a clone instead, which downloads nothing:
 git clone https://github.com/a44-io/beads_watch.git && cd beads_watch && ./setup.sh
 ```
 
-Or by hand, if you would rather wire it up yourself:
+Or by hand, if you would rather wire it up yourself. Either of these leaves
+a binary with no commit stamp, which is fine; `--version` just says less:
 
 ```bash
+go install github.com/a44-io/beads_watch@latest   # or, from a clone:
 go build -o ~/.local/bin/beads_watch .
 beads_watch --version
 ```

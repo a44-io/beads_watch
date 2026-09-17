@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"beads_watch/internal/events"
+	"github.com/a44-io/beads_watch/internal/events"
 )
 
 // Repo is one beads workspace this node serves.

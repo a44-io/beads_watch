@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"strings"
 
-	"beads_watch/internal/brexec"
+	"github.com/a44-io/beads_watch/internal/brexec"
 )
 
 // Event is the JSON body of every published message: the audit row br wrote,

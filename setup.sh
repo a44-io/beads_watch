@@ -704,8 +704,10 @@ build_from_source() { # leaves the binary at $TMP/beads_watch
   commit=$(git -C "$src" rev-parse HEAD 2>/dev/null || echo "")
   built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   ldflags="-s -w"
-  [[ -n "$commit" ]] && ldflags+=" -X beads_watch/internal/server.Commit=$commit"
-  ldflags+=" -X beads_watch/internal/server.BuiltAt=$built_at"
+  # Full import paths, tracking go.mod's module line: a stale path here would
+  # stamp nothing and the binary would report no commit.
+  [[ -n "$commit" ]] && ldflags+=" -X github.com/a44-io/beads_watch/internal/server.Commit=$commit"
+  ldflags+=" -X github.com/a44-io/beads_watch/internal/server.BuiltAt=$built_at"
 
   info "building with go (this takes a moment)"
   (cd "$src" && CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" -o "$TMP/$BIN_NAME" .) ||
