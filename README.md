@@ -37,15 +37,15 @@ Every command below is a real transcript against a running daemon.
 $ curl -s --unix-socket /run/user/1000/beads_watch.sock http://local/v1/health
 { "node": "dev", "ok": true, "repos": 5, "version": "1.1.0" }
 
-# or over the tailnet, through caddy
-$ curl -s https://beads-dev.dev.a44.io/v1/health
+# or over the tailnet, through the reverse proxy
+$ curl -s https://beads-dev.example.com/v1/health
 { "node": "dev", "ok": true, "repos": 5, "version": "1.1.0" }
 ```
 
 Run a `br` subcommand in a named repo. The body is `br`'s stdout, unchanged:
 
 ```console
-$ curl -s https://beads-dev.dev.a44.io/v1/repos/beads_watch/br \
+$ curl -s https://beads-dev.example.com/v1/repos/beads_watch/br \
     -H 'Content-Type: application/json' \
     -d '{"args":["ready","--limit","3"]}' | jq -r '.[].title'
 Switch tailscale serve from localhost TCP to the unix socket
@@ -56,7 +56,7 @@ Forwarded identity is trusted from ANY peer
 Writes work the same way, and the audit trail records who did it:
 
 ```console
-$ curl -s https://beads-dev.dev.a44.io/v1/repos/beads_watch/br \
+$ curl -s https://beads-dev.example.com/v1/repos/beads_watch/br \
     -d '{"args":["create","Fix the thing","-p","2","-t","bug"]}'
 ```
 
@@ -82,31 +82,32 @@ curl -s 127.0.0.1:7717/v1/repos/demo/br -d '{"args":["stats"]}'
 
 ```
 any tailnet machine / phone
-   │  https://beads-arch.dev.a44.io
+   │  https://beads-<node>.example.com
    ▼
-caddy on pi          wildcard *.dev.a44.io cert (DNS-01), tailnet-bound
-   │  reverse_proxy 100.110.83.42:8438      (a trusted proxy: its headers count)
+reverse proxy        on the proxy box; caddy in the reference setup, with a
+                     wildcard *.example.com cert (DNS-01), tailnet-bound
+   │  reverse_proxy 100.64.0.10:8438        (a trusted proxy: its headers count)
    ▼
-beads_watch          listen 100.110.83.42:8438 (tailscale IP only)
+beads_watch          listen 100.64.0.10:8438 (this box's tailscale IP only)
    │                 + unix:/run/user/1000/beads_watch.sock, 0600, for local callers
    │  exec: br <args...>   (cwd = repo, hostile env scrubbed)
    ▼
 .beads/
 ```
 
-Caddy on pi does the transport: HTTPS with a real wildcard cert, listening
-only on the tailnet address. On each serving box the daemon binds that box's
-own tailscale IP, so caddy reaches it directly and the daemon sees the real
-peer of every connection, which is what lets it believe caddy's forwarded
-identity and nobody else's. The daemon still writes zero auth and zero TLS.
-(`tailscale serve` used to play caddy's role, and a `systemd-socket-proxyd`
-bridge used to sit between caddy and the socket; the bridge erased the peer,
-which is why it is gone.)
+The reverse proxy does the transport: HTTPS with a real wildcard cert,
+listening only on the tailnet address. On each serving box the daemon binds
+that box's own tailscale IP, so the proxy reaches it directly and the daemon
+sees the real peer of every connection, which is what lets it believe the
+proxy's forwarded identity and nobody else's. The daemon still writes zero
+auth and zero TLS. (`tailscale serve` used to play the proxy's role, and a
+`systemd-socket-proxyd` bridge used to sit between the proxy and the socket;
+the bridge erased the peer, which is why it is gone.)
 
 When repos live on other machines, there is still no hub to build. Each
-machine runs this same binary on its own address, and caddy names it
-`beads-<node>.dev.a44.io`: `beads-arch`, `beads-dev`, and so on. **The
-caddy sites directory is the directory.**
+machine runs this same binary on its own address, and the proxy names it
+`beads-<node>.example.com`: `beads-arch`, `beads-dev`, and so on. **The
+proxy's sites directory is the directory.**
 
 ## API
 
@@ -162,11 +163,11 @@ endpoint shows which case a caller landed in:
 ```json
 {
   "identity": { "actor": "dev", "source": "tailscale-whois", "verified": true },
-  "transport": { "network": "tcp", "peer": "100.79.209.73", "trusted_proxy": true },
+  "transport": { "network": "tcp", "peer": "100.64.0.20", "trusted_proxy": true },
   "tailscale_headers": {},
   "user_header_forwarded": false,
-  "peer_addr": "100.70.239.127",
-  "remote_addr": "100.79.209.73:41022"
+  "peer_addr": "100.64.0.30",
+  "remote_addr": "100.64.0.20:41022"
 }
 ```
 
@@ -255,7 +256,7 @@ export is rewritten, saying "something changed in `<repo>`, go ask `br`"
 and nothing else:
 
 ```console
-$ curl -sN https://beads-arch.dev.a44.io/v1/events
+$ curl -sN https://beads-arch.example.com/v1/events
 : connected
 
 event: change
@@ -294,9 +295,9 @@ owns its listeners, so it knows which one a connection arrived on and, on
 TCP, the peer's real address; nothing in a request can change either. That
 splits callers into three cases:
 
-- **A trusted proxy** (its address is in `trusted_proxies`; on this tailnet,
-  caddy on pi). Its forwarded headers are its own word, and are read in
-  order:
+- **A trusted proxy** (its address is in `trusted_proxies`; the caddy box in
+  the reference setup). Its forwarded headers are its own word, and are read
+  in order:
   1. **`Tailscale-User-Login`**: the proxy must *strip* a client-supplied
      copy, so its presence means the proxy itself put it there. `tailscale
      serve` does this natively; caddy does not, so the beads site files
@@ -324,7 +325,7 @@ Then, for every case:
 4. **Nothing**: `BD_ACTOR` is left unset and `br` uses its own default.
 
 The proxy behaviours above were established by experiment (tailscale 1.98.9;
-caddy via the live `beads-arch.dev.a44.io` chain), and the direct-peer rule
+caddy via a live `beads-arch.example.com` chain), and the direct-peer rule
 has unit tests against a fake `tailscale whois`. A request from `dev`
 through caddy resolves to `actor: dev`, `source: tailscale-whois`,
 `verified: true`, and one carrying forged headers still does. The same
@@ -336,11 +337,12 @@ through an unlisted proxy is still served, attributed to the proxy *machine*
 (that is the peer the transport sees), which is accurate as far as it goes
 and also the sign that the list is missing an entry.
 
-**On this tailnet, user identity is not available.** 13 of 15 nodes are
-`tagged-devices`, which have no owning user for tailscale to report. So the
-actor is the *machine*: a write from `dev` records `created_by: "dev"`, which
-the transport has verified. For the same reason, when the daemon knows
-nothing it reports `"source": "none"` and does not guess.
+**On a tailnet of tagged devices, user identity is not available.** Tagged
+devices have no owning user for tailscale to report (13 of the 15 nodes on
+the tailnet this was built for are tagged). So the actor is the *machine*: a
+write from `dev` records `created_by: "dev"`, which the transport has
+verified. For the same reason, when the daemon knows nothing it reports
+`"source": "none"` and does not guess.
 
 ## Security
 
@@ -388,21 +390,23 @@ The full contract, delivery semantics, and subscriber recipes live in
 
 ## Install
 
-From any tailnet box, one line. The cache buster matters, because dufs and
-caddy will each happily hand you yesterday's copy:
+One line, from the latest [GitHub Release](https://github.com/a44-io/beads_watch/releases):
 
 ```bash
-curl -fsSL "https://bw.dev.a44.io/setup.sh?$(date +%s)" | bash
+curl -fsSL https://github.com/a44-io/beads_watch/releases/latest/download/setup.sh | bash
 ```
 
-That installs a prebuilt binary matching the served commit, discovers the
-`.beads` workspaces on the box, writes the config with this box's own tailnet
-address as `listen` and the proxy box (`pi`, resolved with `tailscale ip`;
-`--proxy-host` or `--trusted-proxy` to say otherwise) as `trusted_proxies`,
-generates the systemd unit, starts it, and health-checks all of it. `--yes`
-takes every default for an unattended run; `--dry-run` prints the plan and
-changes nothing; `--uninstall` reverses it and keeps every `.beads`. See
-[Releases](#releases) for what is being served and how it gets there.
+That installs a prebuilt binary matching the release's commit, verified by
+sha256 against the release's own `SHA256SUMS` and `manifest.json`, discovers
+the `.beads` workspaces on the box, writes the config with this box's own
+tailnet address as `listen` and the proxy box (`--proxy-host <name>`,
+resolved with `tailscale ip`, or `--trusted-proxy <ip>` to skip the lookup)
+as `trusted_proxies`, generates the systemd unit, starts it, and
+health-checks all of it. Flags go after `bash -s --`: `--yes` takes every
+default for an unattended run; `--version v1.2.0` installs that release
+instead of the latest; `--dry-run` prints the plan and changes nothing;
+`--uninstall` reverses it and keeps every `.beads`. See
+[Releases](#releases) for what a release contains and how it is cut.
 
 Re-running it is safe. An existing `config.json` is never rewritten, not by
 a plain re-run and not by `--force`, which only means "reinstall the binary
@@ -417,16 +421,24 @@ of these a run would do. An upgrade from a version that had the
 `systemd-socket-proxyd` bridge retires the pair once the config has a
 `listen` address, and keeps it, with a warning, until then.
 
-Needs `br` on `PATH`, plus tailscale for the tailnet address. It falls back
-to building from source when no prebuilt matches the box, which needs Go
-1.24+.
+Needs `br` on `PATH`, plus tailscale for the tailnet address. Prebuilts
+exist for linux/amd64 and linux/arm64; anywhere else it clones the repo at
+the release's tag and builds, which needs Go 1.24+.
 
-From a clone instead, which skips the fileserver entirely:
+From a clone instead, which downloads nothing:
 
 ```bash
-git clone https://github.com/a44-io/beads_watch.git
-cd beads_watch
-./setup.sh          # same installer, building from this checkout
+git clone https://github.com/a44-io/beads_watch.git && cd beads_watch && ./setup.sh
+```
+
+From a private fileserver, for a fleet that publishes its own builds with
+`scripts/publish-dist.sh` (see [Private fleet](#private-fleet)). The served
+copy of `setup.sh` has its URL stamped in; a hand-downloaded copy needs
+telling, and a plain directory works the same way for an offline install:
+
+```bash
+curl -fsSL https://dist.example.com/setup.sh | BW_DIST_URL=https://dist.example.com bash
+./setup.sh --dist-url /mnt/dist
 ```
 
 Or by hand, if you would rather wire it up yourself:
@@ -441,8 +453,8 @@ Write a config at `~/.config/beads_watch/config.json`:
 ```json
 {
   "socket": "/run/user/1000/beads_watch.sock",
-  "listen": "100.110.83.42:8438",
-  "trusted_proxies": ["100.79.209.73"],
+  "listen": "100.64.0.10:8438",
+  "trusted_proxies": ["100.64.0.20"],
   "repos": [
     { "name": "cell", "path": "/home/goku/cell" },
     { "name": "beads_watch", "path": "/home/goku/dev/beads_watch" }
@@ -451,8 +463,9 @@ Write a config at `~/.config/beads_watch/config.json`:
 ```
 
 `listen` is this box's own `tailscale ip -4`; `trusted_proxies` is the box
-running caddy. Check it before wiring systemd. `--print-config` applies every
-default and validates every repo path without binding anything:
+running the reverse proxy. Check it before wiring systemd. `--print-config`
+applies every default and validates every repo path without binding
+anything:
 
 ```bash
 beads_watch --print-config
@@ -470,24 +483,26 @@ systemctl --user enable --now beads_watch
 loginctl enable-linger "$USER"   # so it survives logout
 ```
 
-Then name it from pi, which takes one line because the wildcard cert already
-covers it:
+Then give it a name on the proxy box. With a wildcard cert already in place
+that is one site block per node, and the two `header_up` strips are not
+optional (see [Identity](#identity); without them a caller could forge a
+verified actor *through* the proxy):
 
-```bash
-ssh pi caddy/expose beads-<node> <tailscale-ip>:8438
+```caddyfile
+beads-<node>.example.com {
+    reverse_proxy 100.64.0.10:8438 {
+        header_up -Tailscale-User-Login
+        header_up -Tailscale-User-Name
+    }
+}
 ```
-
-and copy the `header_up -Tailscale-User-Login` /
-`header_up -Tailscale-User-Name` strips from an existing `beads-*.caddy`
-into the generated site file (see [Identity](#identity); without them a
-caller could forge a verified actor *through* caddy).
 
 Verify all three hops:
 
 ```bash
 curl -s --unix-socket /run/user/1000/beads_watch.sock http://local/v1/health
 curl -s "$(tailscale ip -4 | head -1):8438/v1/health"
-curl -s https://beads-<node>.dev.a44.io/v1/health
+curl -s https://beads-<node>.example.com/v1/health
 ```
 
 The second one is a direct TCP peer, so `/v1/whoami` on it should say
@@ -496,50 +511,49 @@ send; the third should say `tailscale-whois` and `trusted_proxy: true`.
 
 ## Releases
 
-Artifacts are private and live on the tailnet fileserver, never on GitHub. A
-dufs instance on pi serves `/srv/ice/.bw`, caddy fronts it as
-`https://bw.dev.a44.io` under the wildcard cert, and the tailnet ACL is the
-authenticity boundary. There is no signing step because there is no public
-pipeline to sign against; `manifest.json` carries a sha256 for every file and
-`setup.sh` refuses anything that does not match.
+Releases live on [GitHub Releases](https://github.com/a44-io/beads_watch/releases).
+Each one is a tag, and carries a flat set of assets:
 
-Publish from a clean checkout:
-
-```bash
-scripts/publish-dist.sh --url https://bw.dev.a44.io --push pi:/srv/ice/.bw/
-```
-
-Cut a tagged release, which records the tag in the manifest and pushes it:
-
-```bash
-scripts/publish-dist.sh --tag v0.2.0 --push-tag \
-  --url https://bw.dev.a44.io --push pi:/srv/ice/.bw/
-```
-
-It refuses to publish from a dirty tree, because the bundle it builds is `HEAD`
-and uncommitted changes would be left out of what gets served with nothing to
-flag it. `--allow-dirty` overrides that and marks `"dirty": true` in the
-manifest, which `setup.sh` warns about on the way in.
-
-What lands on the fileserver:
-
-| File | What it is |
+| Asset | What it is |
 |---|---|
-| `setup.sh` | the installer, with its `DEFAULT_DIST_URL` stamped in so a bare `curl \| bash` needs no environment |
-| `beads_watch.bundle` | `git bundle` of the branch. A clone from it keeps full history, so a consumer that has to build from source can still stamp its own commit |
-| `bin/beads_watch-<os>-<arch>.tar.gz` | prebuilt, `CGO_ENABLED=0`. Static, so it does not carry the publishing box's glibc to a consumer |
-| `manifest.json` | commit, tag, version, and sha256 for everything above |
+| `setup.sh` | the installer, stamped with this release's own download URL, so the copy fetched from `releases/latest` stays pinned to the release it came with |
+| `beads_watch-linux-amd64.tar.gz`, `beads_watch-linux-arm64.tar.gz` | prebuilt, `CGO_ENABLED=0`. Static, so it does not carry the publishing box's glibc to a consumer |
+| `SHA256SUMS` | `sha256sum` format, covering every other asset |
+| `manifest.json` | commit, tag, version, and sha256 for everything above; what `setup.sh` reads |
 
-One box publishes for the whole fleet: the default targets are
-`linux/amd64,linux/arm64`, and `--targets` takes any GOOS/GOARCH list.
+There is no git bundle on a release: the repo itself is the source, and
+`setup.sh` clones it at the release's tag when it has to build.
 
-Inspect what is being served without installing it:
+To verify by hand, download the assets and check them the usual way:
 
 ```bash
-dfm --server=bw view manifest.json
-dfm --server=bw ls
-curl -s https://bw.dev.a44.io/manifest.json | jq '{commit, tag, generated_at}'
+sha256sum -c SHA256SUMS
 ```
+
+`setup.sh` does the same check, against `manifest.json` and against
+`SHA256SUMS`, and exits 3 with nothing installed when either disagrees.
+Both files ride on the same release as the tarballs, so this is an integrity
+check and says nothing about who uploaded them; there is no Sigstore
+signature yet, because releases are cut from an operator's box rather than a
+CI workflow with an identity worth binding one to.
+
+A release is cut from a clean checkout, and lands as a **draft**:
+
+```bash
+scripts/publish-dist.sh --tag v1.2.0 --release
+```
+
+That tags `HEAD`, cross-compiles, writes the asset set above into
+`dist/release/`, and creates the draft with `gh`. Nothing is public until
+someone reads the draft on GitHub and presses Publish, and a draft creates no
+tag on the remote, so an unpublished one leaves no trace. `--push-tag` pushes
+the tag first, which pins the release to it. The default targets are
+`linux/amd64,linux/arm64`; `--targets` takes any GOOS/GOARCH list.
+
+The script refuses to publish from a dirty tree, because what it builds is
+`HEAD` and uncommitted changes would be left out of what gets served with
+nothing to flag it. `--allow-dirty` overrides that and marks `"dirty": true`
+in the manifest, which `setup.sh` warns about on the way in.
 
 A published binary reports the commit it was built from, which is what makes
 the release traceable:
@@ -547,12 +561,34 @@ the release traceable:
 ```console
 $ beads_watch --version
 beads_watch 1.1.0
-commit: 923ce5017418018c3ff1f0113d91dfefca1ce58e
+commit: 0123456789abcdef0123456789abcdef01234567
 built:  2026-09-09T13:17:48Z
 ```
 
-`GET /v1/health` grows a `commit` field on a published binary too. A source
-build reports neither, since unstamped code cannot say which commit it is.
+`commit` is the sha the binary was built from (illustrative above); it is
+also the `commit` in the release's `manifest.json`. `GET /v1/health` grows a
+`commit` field on a published binary too. A source build reports neither,
+since unstamped code cannot say which commit it is.
+
+### Private fleet
+
+The same script publishes to a private fileserver, for a fleet that wants
+its builds off GitHub or wants to serve a commit that is not a release. It
+builds a directory with `setup.sh` (URL-stamped), a `git bundle` of the
+branch so a consumer's source build can still stamp its own commit,
+`bin/beads_watch-<os>-<arch>.tar.gz`, and `manifest.json`, then rsyncs it:
+
+```bash
+scripts/publish-dist.sh --url https://dist.example.com --push host:/srv/dist/
+```
+
+Both channels combine in one run (`--tag v1.2.0 --release --url … --push …`).
+Consumers install with the fileserver form from [Install](#install), and can
+read what is being served without installing it:
+
+```bash
+curl -s https://dist.example.com/manifest.json | jq '{commit, tag, generated_at}'
+```
 
 ## CLI
 
@@ -579,8 +615,8 @@ ignored.
 ```json
 {
   "socket": "/run/user/1000/beads_watch.sock",
-  "listen": "100.110.83.42:8438",
-  "trusted_proxies": ["100.79.209.73"],
+  "listen": "100.64.0.10:8438",
+  "trusted_proxies": ["100.64.0.20"],
   "repos": [
     { "name": "cell", "path": "/home/goku/cell" }
   ],
@@ -684,13 +720,14 @@ The config rejects unknown keys deliberately. Check the spelling against
 Ask the daemon what it saw:
 
 ```bash
-curl -s https://beads-<node>.dev.a44.io/v1/whoami | jq .
+curl -s https://beads-<node>.example.com/v1/whoami | jq .
 ```
 
 Look at `transport` first. Every write through caddy landing as the *proxy
-box* (`actor: pi`, `source: tailscale-whois-direct`, `trusted_proxy: false`)
-means caddy's address is not in `trusted_proxies`, so the daemon is
-identifying caddy itself instead of reading its headers. `source: none` with
+box* (`actor: <the proxy's node name>`, `source: tailscale-whois-direct`,
+`trusted_proxy: false`) means caddy's address is not in `trusted_proxies`,
+so the daemon is identifying caddy itself instead of reading its headers.
+`source: none` with
 `trusted_proxy: true` means the headers are not arriving: the site file is
 missing the `header_up -Tailscale-User-Login` strip, or `X-Forwarded-For` is
 not reaching the daemon. On a tagged device, an actor equal to the *machine*
@@ -734,9 +771,9 @@ to check.
 - **No `-C` flag in `br` 0.2.22.** Repos are targeted by setting the child's
   working directory, so anything that changes how `br` walks up from cwd
   changes what the daemon serves.
-- **Releases are tailnet-only.** Artifacts live on the private fileserver, not
-  on GitHub, so `curl | bash` works from a tailnet box and nowhere else. There
-  is no package manager and no public download.
+- **Linux prebuilts only.** Releases carry linux/amd64 and linux/arm64
+  tarballs; anywhere else `setup.sh` builds from source, which needs Go
+  1.24+. There is no package manager.
 
 ## FAQ
 
