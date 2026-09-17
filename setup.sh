@@ -53,7 +53,10 @@
 #   --port PORT       tailnet port the daemon listens on (default: 8438)
 #   --proxy-host NAME the box running the reverse proxy; its forwarded identity
 #                     headers are trusted. A MagicDNS name or an ssh alias
-#                     for one (default: pi; also BW_PROXY_HOST)
+#                     for one; also BW_PROXY_HOST. No default: without this
+#                     or --trusted-proxy, trusted_proxies is [] and no
+#                     forwarded identity is believed; direct callers are
+#                     still identified from their own address
 #   --trusted-proxy A trust forwarded identity from this IP or CIDR instead;
 #                     repeatable, and skips resolving --proxy-host
 #   --dry-run         print the plan; change nothing
@@ -109,7 +112,11 @@ UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SRC_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/beads_watch/src"
 LOCK_DIR="${TMPDIR:-/tmp}/beads_watch-setup.lock.d"
 BRIDGE_PORT=8438
-PROXY_HOST="${BW_PROXY_HOST:-pi}"
+# No default proxy box: nothing here knows what fronts this box, and a guessed
+# name that happens to resolve would hand that machine the right to assert
+# who every caller is. Unset means trusted_proxies stays [] and the daemon
+# identifies each caller from its own address.
+PROXY_HOST="${BW_PROXY_HOST:-}"
 TRUSTED_PROXIES=()
 BIN_NAME=beads_watch
 SERVICE_UNIT=beads_watch.service
@@ -774,11 +781,14 @@ proxy_host_ip() {
 
 # The proxies whose forwarded identity the daemon believes, as a JSON array in
 # TRUSTED_JSON. --trusted-proxy wins outright; otherwise the reverse-proxy box
-# is resolved by name, and TRUSTED_RESOLVED records which name became which
-# address. An empty list is honest rather than a guess: traffic through an
-# unlisted proxy is still served, attributed to the proxy machine itself
-# (that is the peer the transport sees), and the warning says so. Resolved
-# once; sets globals rather than printing so it can run outside a subshell.
+# named by --proxy-host is resolved, and TRUSTED_RESOLVED records which name
+# became which address. The list is [] in two cases the messages keep apart:
+# no proxy was named at all (the default; nothing to look up, and an honest
+# state, since the daemon then identifies every caller from its own address),
+# or one was named and did not resolve (a warning, by name). Either way
+# traffic through an unlisted proxy is still served, attributed to the proxy
+# machine itself, the peer the transport sees. Resolved once; sets globals
+# rather than printing so it can run outside a subshell.
 TRUSTED_JSON=""
 TRUSTED_RESOLVED=""
 resolve_trusted_proxies() {
@@ -903,10 +913,12 @@ write_config() {
     case "$kind" in
       key)
         if [[ "$name" == trusted_proxies ]]; then
-          if [[ "$value" == '[]' ]]; then
-            warn "added trusted_proxies = [] — no proxy resolved ($PROXY_HOST); traffic through caddy will be attributed to the proxy box. Re-run with --trusted-proxy IP"
-          else
+          if [[ "$value" != '[]' ]]; then
             info "added $name = $value${TRUSTED_RESOLVED:+ ($TRUSTED_RESOLVED)}"
+          elif [[ -n "$PROXY_HOST" ]]; then
+            warn "added trusted_proxies = []: could not resolve $PROXY_HOST, so no forwarded identity is trusted; traffic through that reverse proxy is attributed to the proxy machine. Pass --trusted-proxy IP to name it by address"
+          else
+            info "added trusted_proxies = []: no reverse proxy named, so forwarded identity is not trusted and every caller is identified from its own address. If a reverse proxy fronts this box, pass --proxy-host NAME or --trusted-proxy IP"
           fi
         else
           info "added $name = $value"
@@ -949,6 +961,23 @@ listen = sys.argv[2]
 need = (listen and not cfg.get("listen")) or "trusted_proxies" not in cfg
 sys.exit(0 if need else 1)
 ' "$CONFIG_FILE" "$listen" 2>/dev/null
+}
+
+# The trusted_proxies the daemon will run with, as JSON: the config on disk
+# when there is one (a re-run never rewrites it, so this run's flags may not
+# be what applies), else what this run resolved. Read-only.
+config_trusted_proxies() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    python3 -c '
+import json, sys
+try:
+    print(json.dumps(json.load(open(sys.argv[1])).get("trusted_proxies") or []))
+except Exception:
+    sys.exit(1)
+' "$CONFIG_FILE" 2>/dev/null && return 0
+  fi
+  resolve_trusted_proxies
+  echo "$TRUSTED_JSON"
 }
 
 # Whether the config the daemon will run with has a listen address, i.e. the
@@ -1387,10 +1416,12 @@ listen_addr_plan() {
 
 trusted_plan() {
   resolve_trusted_proxies
-  if [[ "$TRUSTED_JSON" == '[]' ]]; then
+  if [[ "$TRUSTED_JSON" != '[]' ]]; then
+    echo "$TRUSTED_JSON${TRUSTED_RESOLVED:+ ($TRUSTED_RESOLVED)}"
+  elif [[ -n "$PROXY_HOST" ]]; then
     echo "no proxy (could not resolve $PROXY_HOST; pass --trusted-proxy IP)"
   else
-    echo "$TRUSTED_JSON${TRUSTED_RESOLVED:+ ($TRUSTED_RESOLVED)}"
+    echo "none configured (forwarded identity not trusted; --proxy-host NAME or --trusted-proxy IP to change)"
   fi
 }
 
@@ -1405,8 +1436,18 @@ print_summary() {
   [[ -n "$SIG_STATUS" ]] && lines+=("signed   $SIG_STATUS")
   [[ -n "$ip" ]] && lines+=("tailnet  http://$ip:$BRIDGE_PORT")
   lines+=("")
-  lines+=("Name it from $PROXY_HOST so it gets a URL:")
-  lines+=("  ssh $PROXY_HOST caddy/expose beads-$(node_name) $ip:$BRIDGE_PORT")
+  # What the daemon trusts decides the next step: a listed proxy wants a site
+  # block pointing at this box (the README's Install section has the one to
+  # copy, header strips included); none means forwarded identity is off, and
+  # the honest fix is in the config, since a re-run will not touch it.
+  local trusted
+  trusted=$(config_trusted_proxies)
+  if [[ "$trusted" != '[]' ]]; then
+    lines+=("Give it a name on your reverse proxy: see README → Install")
+    lines+=("  site beads-$(node_name).<domain>  →  reverse_proxy ${ip:-<tailnet-ip>}:$BRIDGE_PORT  (trusts $trusted)")
+  else
+    lines+=("Forwarded identity is off: trusted_proxies is []. List a reverse proxy's IP there to trust it")
+  fi
   lines+=("")
   lines+=("Uninstall:  setup.sh --uninstall")
   echo ""

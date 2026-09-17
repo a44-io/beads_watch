@@ -402,8 +402,9 @@ sha256 against the release's own `SHA256SUMS` and `manifest.json` and, when
 beside each asset (see [Releases](#releases)), discovers
 the `.beads` workspaces on the box, writes the config with this box's own
 tailnet address as `listen` and the proxy box (`--proxy-host <name>`,
-resolved with `tailscale ip`, or `--trusted-proxy <ip>` to skip the lookup)
-as `trusted_proxies`, generates the systemd unit, starts it, and
+resolved with `tailscale ip`, or `--trusted-proxy <ip>` to skip the lookup;
+without either, `trusted_proxies` is empty and no forwarded identity is
+trusted) as `trusted_proxies`, generates the systemd unit, starts it, and
 health-checks all of it. Flags go after `bash -s --`: `--yes` takes every
 default for an unattended run; `--version v1.2.0` installs that release
 instead of the latest; `--require-signature` refuses to install anything
