@@ -799,3 +799,7 @@ write these repos concurrently and waiting beats a client retry loop.
 `br` 0.2.22 has **no `-C` flag**; the daemon targets a repo by setting the
 child process's working directory, which is also what makes `.beads/redirect`
 work.
+
+## License
+
+[MIT](LICENSE).
