@@ -173,7 +173,8 @@ fi
 # --abbrev-ref names "HEAD"; the manifest should say which branch carries the
 # commit, so fall back to the first remote branch that does.
 BRANCH=$(git -C "$REPO" symbolic-ref -q --short HEAD ||
-  git -C "$REPO" branch -r --contains HEAD --format='%(refname:short)' 2>/dev/null | sed 's#^origin/##' | grep -v '^HEAD$' | head -1)
+  git -C "$REPO" for-each-ref --contains HEAD --format='%(refname)' refs/remotes/origin/ 2>/dev/null |
+  sed 's#^refs/remotes/origin/##' | grep -vx HEAD | head -1)
 BRANCH=${BRANCH:-detached}
 [[ "$BRANCH" == main ]] || echo "publish-dist: NOTE publishing branch '$BRANCH', not main" >&2
 
@@ -201,8 +202,17 @@ mkdir -p "$OUT" "$OUT/bin"
 # ── 1. Source bundle ────────────────────────────────────────────────────────
 echo "publish-dist: bundling $BRANCH @ ${COMMIT:0:12}"
 # HEAD must be in the bundle: without it a `git clone` of the bundle cannot pick
-# a default branch and leaves an EMPTY tree on an unborn branch.
-git -C "$REPO" bundle create "$OUT/beads_watch.bundle" HEAD "$BRANCH" 2>/dev/null ||
+# a default branch and leaves an EMPTY tree on an unborn branch. The branch
+# ref rides along when it exists locally; a tag checkout (the release
+# workflow's) has only the remote-tracking one, and the bundle is not a
+# release asset anyway, so that or HEAD alone is fine there.
+BUNDLE_REFS=(HEAD)
+if git -C "$REPO" rev-parse -q --verify "refs/heads/$BRANCH" >/dev/null; then
+  BUNDLE_REFS+=("refs/heads/$BRANCH")
+elif git -C "$REPO" rev-parse -q --verify "refs/remotes/origin/$BRANCH" >/dev/null; then
+  BUNDLE_REFS+=("refs/remotes/origin/$BRANCH")
+fi
+git -C "$REPO" bundle create "$OUT/beads_watch.bundle" "${BUNDLE_REFS[@]}" 2>/dev/null ||
   die 'git bundle failed'
 git bundle verify "$OUT/beads_watch.bundle" >/dev/null || die 'bundle failed verification'
 
